@@ -1,0 +1,105 @@
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import main
+
+
+class TagsDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        main.DATA_DIR = self.root
+        main.THUMB_DIR = self.root / "thumbnails"
+        self.path = self.root / "media_notes.db"
+
+    def make_file(self, name="one.jpg"):
+        path = self.root / name
+        path.write_bytes(b"picture")
+        return path
+
+    def test_multiple_tags_and_and_filter(self):
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        a = db.add_category("A")
+        b = db.add_category("B")
+        c = db.add_category("C")
+        path = self.make_file()
+        self.assertTrue(db.add_media(str(path), "image", [a, b]))
+        media_id = int(db.media_items()[0]["id"])
+        self.assertEqual(set(db.tags_for_media(media_id)), {a, b})
+        self.assertEqual(len(db.media_items([a])), 1)
+        self.assertEqual(len(db.media_items([b])), 1)
+        self.assertEqual(len(db.media_items([a, b])), 1)
+        self.assertEqual(len(db.media_items([a, c])), 0)
+        self.assertEqual(len(db.media_items([db.default_category_id()])), 0)
+
+        db.add_media_tags([media_id], [c])
+        self.assertEqual(set(db.tags_for_media(media_id)), {a, b, c})
+        db.remove_media_tags([media_id], [a])
+        self.assertEqual(set(db.tags_for_media(media_id)), {b, c})
+        db.replace_media_tags([media_id], [])
+        self.assertEqual(db.tags_for_media(media_id), [])
+        self.assertEqual(len(db.media_items([db.default_category_id()])), 1)
+
+    def test_updating_one_media_preserves_other_tags(self):
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        a = db.add_category("A")
+        b = db.add_category("B")
+        db.add_media(str(self.make_file()), "image", [a])
+        media_id = int(db.media_items()[0]["id"])
+        db.update_media(media_id, "My name", "Some note", [a, b], 3)
+        row = db.media_by_id(media_id)
+        self.assertEqual(row["caption"], "My name")
+        self.assertEqual(row["notes"], "Some note")
+        self.assertEqual(row["rating"], 3)
+        self.assertEqual(set(db.tags_for_media(media_id)), {a, b})
+        db.delete_category(a)
+        self.assertEqual(db.tags_for_media(media_id), [b])
+        self.assertEqual(int(db.media_by_id(media_id)["category_id"]), b)
+        self.assertEqual(len(db.media_items([b], "B")), 1)
+
+    def test_legacy_category_migration_and_backup(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.executescript("""
+                CREATE TABLE categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    parent_id INTEGER
+                );
+                CREATE TABLE media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    category_id INTEGER NOT NULL,
+                    caption TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    rating INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    file_device INTEGER, file_inode INTEGER, file_size INTEGER,
+                    fingerprint TEXT
+                );
+                INSERT INTO categories(id, name) VALUES (1, 'Nezařazené');
+                INSERT INTO categories(id, name) VALUES (2, 'Původní tag');
+                INSERT INTO media(id, path, media_type, category_id)
+                VALUES (1, '/tmp/old.gif', 'gif', 2);
+            """)
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        self.assertEqual(db.tags_for_media(1), [2])
+        self.assertTrue((self.root / "media_notes.before_tags.db").exists())
+        self.assertEqual(len(db.media_items([2])), 1)
+        db2 = main.Database(self.path)
+        self.addCleanup(db2.conn.close)
+        self.assertEqual(db2.tags_for_media(1), [2])
+
+
+if __name__ == "__main__":
+    unittest.main()
