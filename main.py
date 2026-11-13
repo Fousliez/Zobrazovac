@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
@@ -52,7 +54,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-APP_VERSION = "0.9.15"
+APP_VERSION = "0.9.16"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -3233,21 +3235,48 @@ class MainWindow(QMainWindow):
 
         self._update_save_button_state()
 
+    def _tags_sorted_by_usage(self):
+        """Show the most used tags first; ties use alphabetical order."""
+        default_id = self.db.default_category_id()
+        return sorted(
+            (
+                row for row in self.db.categories()
+                if int(row["id"]) != default_id
+            ),
+            key=lambda row: (
+                -int(row["media_count"]),
+                self.db.category_path_name(int(row["id"])).casefold(),
+            ),
+        )
+
+    @staticmethod
+    def _add_persistent_tag_checkbox(
+        menu: QMenu, label: str, checked: bool, on_toggled,
+        enabled: bool = True,
+    ) -> QCheckBox:
+        """An embedded widget does not dismiss QMenu when clicked."""
+        checkbox = QCheckBox(label, menu)
+        checkbox.setChecked(checked)
+        checkbox.setEnabled(enabled)
+        checkbox.setStyleSheet("QCheckBox { padding: 5px 12px; }")
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(checkbox)
+        menu.addAction(action)
+        checkbox.toggled.connect(on_toggled)
+        return checkbox
+
     def _rebuild_detail_tag_menu(self) -> None:
         self.detail_tags_menu.clear()
-        default_id = self.db.default_category_id()
-        for row in self.db.categories():
+        for row in self._tags_sorted_by_usage():
             tag_id = int(row["id"])
-            if tag_id == default_id:
-                continue
-            action = self.detail_tags_menu.addAction(
-                self.db.category_path_name(tag_id)
-            )
-            action.setCheckable(True)
-            action.setChecked(tag_id in self.selected_detail_tag_ids)
-            action.triggered.connect(
+            tag_name = self.db.category_path_name(tag_id)
+            count = int(row["media_count"])
+            self._add_persistent_tag_checkbox(
+                self.detail_tags_menu,
+                f"{tag_name}  ·  {count}",
+                tag_id in self.selected_detail_tag_ids,
                 lambda checked, selected_id=tag_id:
-                    self.toggle_detail_tag(selected_id, checked)
+                    self.toggle_detail_tag(selected_id, checked),
             )
         self._refresh_detail_tag_label()
 
@@ -3741,20 +3770,35 @@ class MainWindow(QMainWindow):
         add_tag_menu = menu.addMenu("Přidat tag")
         remove_tag_menu = menu.addMenu("Odebrat tag")
         frozen_move_ids = tuple(selected_ids)
-        for row in self.db.categories():
-            category_id = int(row["id"])
-            if category_id == self.db.default_category_id():
-                continue
-            tag_name = self.db.category_path_name(category_id)
-            add_action = add_tag_menu.addAction(tag_name)
-            add_action.triggered.connect(
-                lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
-                    self.move_media_ids_to(list(ids), target_id)
+        assigned = {
+            media_id: set(self.db.tags_for_media(media_id))
+            for media_id in frozen_move_ids
+        }
+        for row in self._tags_sorted_by_usage():
+            tag_id = int(row["id"])
+            tag_name = self.db.category_path_name(tag_id)
+            count = int(row["media_count"])
+            checked_for_all = all(
+                tag_id in assigned[media_id] for media_id in frozen_move_ids
             )
-            remove_action = remove_tag_menu.addAction(tag_name)
-            remove_action.triggered.connect(
-                lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
+            checked_for_any = any(
+                tag_id in assigned[media_id] for media_id in frozen_move_ids
+            )
+            label = f"{tag_name}  ·  {count}"
+            self._add_persistent_tag_checkbox(
+                add_tag_menu, label,
+                checked=checked_for_all,
+                enabled=not checked_for_all,
+                on_toggled=lambda checked, target_id=tag_id, ids=frozen_move_ids:
+                    self.move_media_ids_to(list(ids), target_id) if checked else None,
+            )
+            self._add_persistent_tag_checkbox(
+                remove_tag_menu, label,
+                checked=checked_for_any,
+                enabled=checked_for_any,
+                on_toggled=lambda checked, target_id=tag_id, ids=frozen_move_ids:
                     self.remove_tag_from_media_ids(list(ids), target_id)
+                    if not checked else None,
             )
 
         menu.addSeparator()
