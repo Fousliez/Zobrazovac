@@ -65,6 +65,49 @@ class TagsDatabaseTests(unittest.TestCase):
         self.assertEqual(int(db.media_by_id(media_id)["category_id"]), b)
         self.assertEqual(len(db.media_items([b], "B")), 1)
 
+    def test_ctrl_click_filters_intersection_in_window(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        a = db.add_category("Tag A")
+        b = db.add_category("Tag B")
+        db.add_media(str(self.make_file("one.jpg")), "image", [a, b])
+        db.add_media(str(self.make_file("two.jpg")), "image", [a])
+        main.DB_PATH = self.path
+        app = QApplication.instance() or QApplication([])
+        window = main.MainWindow()
+        self.addCleanup(window.close)
+        window.show()
+        app.processEvents()
+
+        def click_tag(tag_id, modifiers):
+            for index in range(window.category_list.count()):
+                item = window.category_list.item(index)
+                if item.data(Qt.UserRole) == tag_id:
+                    pos = window.category_list.visualItemRect(item).center()
+                    QTest.mouseClick(
+                        window.category_list.viewport(),
+                        Qt.LeftButton,
+                        modifiers,
+                        pos=pos,
+                    )
+                    app.processEvents()
+                    return
+            self.fail(f"Missing tag {tag_id}")
+
+        click_tag(a, Qt.NoModifier)
+        self.assertEqual(window.selected_category_ids(), [a])
+        self.assertEqual(window.media_list.count(), 2)
+        click_tag(b, Qt.ControlModifier)
+        self.assertEqual(set(window.selected_category_ids()), {a, b})
+        self.assertEqual(window.media_list.count(), 1)
+        click_tag(b, Qt.NoModifier)
+        self.assertEqual(window.selected_category_ids(), [b])
+        self.assertEqual(window.media_list.count(), 1)
+
     def test_legacy_category_migration_and_backup(self):
         with sqlite3.connect(self.path) as conn:
             conn.executescript("""
