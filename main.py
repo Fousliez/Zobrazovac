@@ -52,7 +52,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-APP_VERSION = "0.9.14"
+APP_VERSION = "0.9.15"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -150,6 +150,7 @@ def video_thumbnail_path(media_id: int) -> Path:
 class Database:
     def __init__(self, path: Path):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.db_path = path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self._create_schema()
@@ -238,6 +239,40 @@ class Database:
                     f"ALTER TABLE media ADD COLUMN {name} {sql_type}"
                 )
 
+        # Migrate legacy assignments exactly once; keep a local backup.
+        migrated = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_tags'"
+        ).fetchone() is not None
+        self.conn.commit()
+        if not migrated:
+            if self.conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]:
+                backup_path = self.db_path.with_name("media_notes.before_tags.db")
+                if not backup_path.exists():
+                    with sqlite3.connect(backup_path) as backup:
+                        self.conn.backup(backup)
+            self.conn.execute(
+                """
+                CREATE TABLE media_tags (
+                    media_id INTEGER NOT NULL,
+                    category_id INTEGER NOT NULL,
+                    PRIMARY KEY (media_id, category_id),
+                    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE,
+                    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO media_tags(media_id, category_id)
+                SELECT m.id, m.category_id
+                FROM media m
+                JOIN categories c ON c.id = m.category_id
+                WHERE c.name != 'Nezařazené' COLLATE NOCASE
+                """
+            )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(category_id)"
+        )
         self.conn.commit()
 
     def _backfill_media_identity(self) -> None:
@@ -337,15 +372,17 @@ class Database:
         rows = self.conn.execute(
             """
             SELECT
-                c.id,
-                c.name,
-                c.sort_order,
-                c.parent_id,
-                COUNT(m.id) AS media_count
+                c.id, c.name, c.sort_order, c.parent_id,
+                CASE WHEN c.id = ? THEN (
+                    SELECT COUNT(*) FROM media m WHERE NOT EXISTS (
+                        SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id
+                    )
+                ) ELSE (
+                    SELECT COUNT(*) FROM media_tags mt WHERE mt.category_id = c.id
+                ) END AS media_count
             FROM categories c
-            LEFT JOIN media m ON m.category_id = c.id
-            GROUP BY c.id, c.name, c.sort_order, c.parent_id
-            """
+            """,
+            (self.default_category_id(),),
         ).fetchall()
 
         parents = sorted(
@@ -357,7 +394,6 @@ class Database:
             if row["parent_id"] is None:
                 continue
             children_by_parent.setdefault(int(row["parent_id"]), []).append(row)
-
         ordered = []
         for parent in parents:
             ordered.append(parent)
@@ -366,7 +402,6 @@ class Database:
                 key=lambda row: (int(row["sort_order"]), int(row["id"]))
             )
             ordered.extend(children)
-
         return ordered
 
     def category_by_id(self, category_id: int):
@@ -413,14 +448,14 @@ class Database:
         if parent_id is not None:
             parent = self.category_by_id(int(parent_id))
             if parent is None:
-                raise ValueError("Nadřazená kategorie neexistuje.")
+                raise ValueError("Nadřazený tag neexistuje.")
             if parent["parent_id"] is not None:
                 raise ValueError(
-                    "Podkategorie může být zatím jen jednu úroveň hluboko."
+                    "Podtag může být zatím jen jednu úroveň hluboko."
                 )
             if int(parent_id) == self.default_category_id():
                 raise ValueError(
-                    "Do kategorie „Nezařazené“ nelze přidat podkategorii."
+                    "Do „Nezařazené“ nelze přidat podtag."
                 )
 
             next_order = self.conn.execute(
@@ -452,7 +487,7 @@ class Database:
 
     def rename_category(self, category_id: int, name: str) -> None:
         if category_id == self.default_category_id():
-            raise ValueError("Kategorie „Nezařazené“ má pevný název.")
+            raise ValueError("Položka „Nezařazené“ má pevný název.")
         self.conn.execute(
             "UPDATE categories SET name = ? WHERE id = ?",
             (name, category_id),
@@ -511,13 +546,19 @@ class Database:
     def delete_category(self, category_id: int) -> None:
         default_id = self.default_category_id()
         if category_id == default_id:
-            raise ValueError("Výchozí kategorii „Nezařazené“ nelze smazat.")
+            raise ValueError("Výchozí položku „Nezařazené“ nelze smazat.")
         if self.has_subcategories(category_id):
-            raise ValueError(
-                "Kategorie obsahuje podkategorie. "
-                "Nejdřív smaž její podkategorie."
-            )
+            raise ValueError("Tag obsahuje podtagy. Nejdřív smaž jeho podtagy.")
 
+        affected = self.conn.execute(
+            "SELECT media_id FROM media_tags WHERE category_id = ?",
+            (category_id,),
+        ).fetchall()
+        self.conn.execute(
+            "DELETE FROM media_tags WHERE category_id = ?", (category_id,)
+        )
+        for row in affected:
+            self._sync_primary_category(int(row["media_id"]))
         self.conn.execute(
             "UPDATE media SET category_id = ? WHERE category_id = ?",
             (default_id, category_id),
@@ -526,7 +567,7 @@ class Database:
         self.conn.commit()
         self._normalize_category_order()
 
-    def add_media(self, path: str, media_type: str, category_id: int) -> bool:
+    def add_media(self, path: str, media_type: str, category_ids: list[int]) -> bool:
         normalized = normalized_path(path)
         exists = self.conn.execute(
             "SELECT id FROM media WHERE path = ? LIMIT 1",
@@ -535,30 +576,26 @@ class Database:
         if exists is not None:
             return False
 
+        default_id = self.default_category_id()
+        tag_ids = sorted({int(i) for i in category_ids if int(i) != default_id})
         file_path = Path(normalized)
         device, inode, size, fingerprint = file_identity(file_path)
-        self.conn.execute(
+        cursor = self.conn.execute(
             """
             INSERT INTO media(
-                path,
-                media_type,
-                category_id,
-                file_device,
-                file_inode,
-                file_size,
-                fingerprint
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                path, media_type, category_id, file_device, file_inode,
+                file_size, fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                normalized,
-                media_type,
-                category_id,
-                device,
-                inode,
-                size,
-                fingerprint,
+                normalized, media_type,
+                tag_ids[0] if tag_ids else default_id,
+                device, inode, size, fingerprint,
             ),
+        )
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+            [(int(cursor.lastrowid), category_id) for category_id in tag_ids],
         )
         self.conn.commit()
         return True
@@ -641,63 +678,133 @@ class Database:
             updated.append(int(row["id"]))
         return updated
 
-    def media_items(self, category_id: int | None = None, search: str = ""):
+    def media_items(self, category_ids: list[int] | None = None, search: str = ""):
         query = """
-            SELECT m.*, c.name AS category_name
-            FROM media m
-            JOIN categories c ON c.id = m.category_id
-            WHERE 1 = 1
+            SELECT m.*, COALESCE((
+                SELECT GROUP_CONCAT(c.name, ', ')
+                FROM media_tags mt JOIN categories c ON c.id = mt.category_id
+                WHERE mt.media_id = m.id
+            ), 'Bez tagů') AS category_name
+            FROM media m WHERE 1 = 1
         """
         params: list[object] = []
-
-        if category_id is not None:
-            query += " AND m.category_id = ?"
-            params.append(category_id)
+        tags = list(dict.fromkeys(category_ids or []))
+        if tags:
+            if self.default_category_id() in tags:
+                query += """
+                    AND NOT EXISTS (
+                        SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id
+                    )
+                """
+            else:
+                placeholders = ",".join("?" for _ in tags)
+                query += f"""
+                    AND m.id IN (
+                        SELECT mt.media_id FROM media_tags mt
+                        WHERE mt.category_id IN ({placeholders})
+                        GROUP BY mt.media_id
+                        HAVING COUNT(DISTINCT mt.category_id) = ?
+                    )
+                """
+                params.extend([*tags, len(tags)])
 
         if search.strip():
             needle = f"%{search.strip()}%"
             query += """
                 AND (
-                    m.caption LIKE ?
-                    OR m.notes LIKE ?
-                    OR m.path LIKE ?
-                    OR c.name LIKE ?
+                    m.caption LIKE ? OR m.notes LIKE ? OR m.path LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM media_tags mt
+                        JOIN categories c ON c.id = mt.category_id
+                        WHERE mt.media_id = m.id AND c.name LIKE ?
+                    )
                 )
             """
             params.extend([needle, needle, needle, needle])
-
         query += " ORDER BY m.id DESC"
         return self.conn.execute(query, params).fetchall()
 
     def media_by_id(self, media_id: int):
         return self.conn.execute(
             """
-            SELECT m.*, c.name AS category_name
-            FROM media m
-            JOIN categories c ON c.id = m.category_id
-            WHERE m.id = ?
+            SELECT m.*, COALESCE((
+                SELECT GROUP_CONCAT(c.name, ', ')
+                FROM media_tags mt JOIN categories c ON c.id = mt.category_id
+                WHERE mt.media_id = m.id
+            ), 'Bez tagů') AS category_name
+            FROM media m WHERE m.id = ?
             """,
             (media_id,),
         ).fetchone()
 
+    def tags_for_media(self, media_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT category_id FROM media_tags WHERE media_id = ?",
+            (media_id,),
+        ).fetchall()
+        return [int(row["category_id"]) for row in rows]
+
+    def _sync_primary_category(self, media_id: int) -> None:
+        row = self.conn.execute(
+            "SELECT MIN(category_id) AS id FROM media_tags WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+        category_id = (
+            int(row["id"]) if row["id"] is not None
+            else self.default_category_id()
+        )
+        self.conn.execute(
+            "UPDATE media SET category_id = ? WHERE id = ?",
+            (category_id, media_id),
+        )
+
+    def replace_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        default_id = self.default_category_id()
+        tags = sorted({int(tag_id) for tag_id in tag_ids if int(tag_id) != default_id})
+        for media_id in media_ids:
+            self.conn.execute(
+                "DELETE FROM media_tags WHERE media_id = ?", (media_id,)
+            )
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+                [(media_id, category_id) for category_id in tags],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
+    def add_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        tags = {int(tag_id) for tag_id in tag_ids}
+        tags.discard(self.default_category_id())
+        for media_id in media_ids:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+                [(media_id, category_id) for category_id in tags],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
+    def remove_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        for media_id in media_ids:
+            self.conn.executemany(
+                "DELETE FROM media_tags WHERE media_id = ? AND category_id = ?",
+                [(media_id, category_id) for category_id in tag_ids],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
     def update_media(
-        self,
-        media_id: int,
-        caption: str,
-        notes: str,
-        category_id: int,
-        rating: int,
+        self, media_id: int, caption: str, notes: str,
+        tag_ids: list[int], rating: int,
     ) -> None:
         rating = max(0, min(3, int(rating)))
         self.conn.execute(
             """
-            UPDATE media
-            SET caption = ?, notes = ?, category_id = ?, rating = ?
+            UPDATE media SET caption = ?, notes = ?, rating = ?
             WHERE id = ?
             """,
-            (caption, notes, category_id, rating, media_id),
+            (caption, notes, rating, media_id),
         )
-        self.conn.commit()
+        self.replace_media_tags([media_id], tag_ids)
 
     def update_media_rating(self, media_id: int, rating: int) -> None:
         rating = max(0, min(3, int(rating)))
@@ -719,14 +826,8 @@ class Database:
         self.conn.commit()
 
     def move_media(self, media_ids: list[int], category_id: int) -> None:
-        if not media_ids:
-            return
-        placeholders = ",".join("?" for _ in media_ids)
-        self.conn.execute(
-            f"UPDATE media SET category_id = ? WHERE id IN ({placeholders})",
-            [category_id, *media_ids],
-        )
-        self.conn.commit()
+        # Preserve old call sites, but add a tag instead of moving a file.
+        self.add_media_tags(media_ids, [category_id])
 
     def delete_media_ids(self, media_ids: list[int]) -> None:
         if not media_ids:
@@ -1374,7 +1475,8 @@ class MainWindow(QMainWindow):
         self.current_preview_path: Path | None = None
         self.current_preview_type: str | None = None
         self.current_rating = 0
-        self.loaded_detail_state: tuple[str, str, int, int] | None = None
+        self.loaded_detail_state: tuple[str, str, tuple[int, ...], int] | None = None
+        self.selected_detail_tag_ids: set[int] = set()
         self.loading_detail = False
         self.thumbnail_mode = "medium"
         self.sort_descending = True
@@ -1600,20 +1702,24 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(notebook_separator)
 
         sidebar_header = QHBoxLayout()
-        category_heading = QLabel("Kategorie")
+        category_heading = QLabel("Tagy")
         category_heading.setObjectName("sectionTitle")
         sidebar_header.addWidget(category_heading)
         sidebar_header.addStretch()
 
         self.add_category_btn = QPushButton("＋")
         self.add_category_btn.setObjectName("miniButton")
-        self.add_category_btn.setToolTip("Nová kategorie")
+        self.add_category_btn.setToolTip("Nový tag")
         self.add_category_btn.setFixedSize(30, 30)
         sidebar_header.addWidget(self.add_category_btn)
         sidebar_layout.addLayout(sidebar_header)
 
         self.category_list = QListWidget()
         self.category_list.setObjectName("categoryList")
+        self.category_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.category_list.setToolTip(
+            "Kliknutí: jeden tag. Ctrl + kliknutí: kombinace více tagů."
+        )
         self.category_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.category_list.setSpacing(2)
         self.category_list.setItemDelegate(CategoryDelegate(self.category_list))
@@ -1624,24 +1730,24 @@ class MainWindow(QMainWindow):
 
         self.rename_category_btn = QPushButton("Přejmenovat")
         self.rename_category_btn.setFixedHeight(30)
-        self.rename_category_btn.setToolTip("Přejmenovat vybranou kategorii")
+        self.rename_category_btn.setToolTip("Přejmenovat vybranou tag")
         category_buttons.addWidget(self.rename_category_btn)
 
         self.category_up_btn = QPushButton("↑")
         self.category_up_btn.setObjectName("miniButton")
-        self.category_up_btn.setToolTip("Posunout kategorii nahoru")
+        self.category_up_btn.setToolTip("Posunout tag nahoru")
         self.category_up_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.category_up_btn)
 
         self.category_down_btn = QPushButton("↓")
         self.category_down_btn.setObjectName("miniButton")
-        self.category_down_btn.setToolTip("Posunout kategorii dolů")
+        self.category_down_btn.setToolTip("Posunout tag dolů")
         self.category_down_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.category_down_btn)
 
         self.delete_category_btn = QPushButton("×")
         self.delete_category_btn.setObjectName("dangerMiniButton")
-        self.delete_category_btn.setToolTip("Smazat kategorii")
+        self.delete_category_btn.setToolTip("Smazat tag")
         self.delete_category_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.delete_category_btn)
 
@@ -1859,12 +1965,16 @@ class MainWindow(QMainWindow):
         )
         detail_layout.addWidget(self.caption_edit)
 
-        category_label = QLabel("Kategorie")
+        category_label = QLabel("Tagy")
         category_label.setObjectName("fieldLabel")
         detail_layout.addWidget(category_label)
 
-        self.category_combo = QComboBox()
-        detail_layout.addWidget(self.category_combo)
+        self.detail_tag_button = QPushButton("Bez tagů")
+        self.detail_tag_button.setEnabled(False)
+        self.detail_tag_button.setToolTip("Vyber tagy přiřazené tomuto médiu")
+        self.detail_tags_menu = QMenu(self.detail_tag_button)
+        self.detail_tag_button.setMenu(self.detail_tags_menu)
+        detail_layout.addWidget(self.detail_tag_button)
 
         buttons = QHBoxLayout()
         self.save_btn = QPushButton("Uložit změny")
@@ -1900,7 +2010,7 @@ class MainWindow(QMainWindow):
         self.category_up_btn.clicked.connect(lambda: self.move_category(-1))
         self.category_down_btn.clicked.connect(lambda: self.move_category(1))
 
-        self.category_list.currentItemChanged.connect(self.on_category_changed)
+        self.category_list.itemSelectionChanged.connect(self.on_category_changed)
         self.category_list.itemDoubleClicked.connect(
             self.toggle_category_expanded
         )
@@ -1928,7 +2038,6 @@ class MainWindow(QMainWindow):
         self.caption_edit.textChanged.connect(self._on_detail_edited)
         self.notes_edit.textChanged.connect(self._on_detail_edited)
         self.notes_edit.editRequested.connect(self._enable_note_editing)
-        self.category_combo.currentIndexChanged.connect(self._on_detail_edited)
 
         self.save_btn.clicked.connect(self.save_current)
         self.delete_media_btn.clicked.connect(self.delete_selected_media)
@@ -2426,13 +2535,16 @@ class MainWindow(QMainWindow):
         self.save_current()
 
     def reload_categories(self, keep_category_id: int | None = None) -> None:
-        if keep_category_id is None:
-            keep_category_id = self.selected_category_id()
+        previous_ids = {
+            item.data(Qt.UserRole) for item in self.category_list.selectedItems()
+        }
+        if not previous_ids:
+            previous_ids = {None}
+        if keep_category_id is not None and keep_category_id not in previous_ids:
+            previous_ids = {keep_category_id}
 
         self.category_list.blockSignals(True)
-        self.category_combo.blockSignals(True)
         self.category_list.clear()
-        self.category_combo.clear()
 
         total = self.db.total_media_count()
         all_item = QListWidgetItem(f"Vše  ·  {total}")
@@ -2444,88 +2556,85 @@ class MainWindow(QMainWindow):
         all_item.setSizeHint(QSize(all_item.sizeHint().width(), 34))
         self.category_list.addItem(all_item)
 
-        selected_row = 0
         rows = self.db.categories()
         parent_names = {
             int(row["id"]): str(row["name"])
-            for row in rows
-            if row["parent_id"] is None
+            for row in rows if row["parent_id"] is None
         }
         parent_ids_with_children = {
             int(row["parent_id"])
-            for row in rows
-            if row["parent_id"] is not None
+            for row in rows if row["parent_id"] is not None
         }
 
-        for row_index, row in enumerate(rows, start=1):
+        for row in rows:
             category_id = int(row["id"])
             name = str(row["name"])
             count = int(row["media_count"])
             parent_id = (
-                None
-                if row["parent_id"] is None
-                else int(row["parent_id"])
+                None if row["parent_id"] is None else int(row["parent_id"])
             )
-
             if parent_id is None:
                 display_text = f"{name}  ·  {count}"
                 path_name = name
             else:
                 display_text = f"    {name}  ·  {count}"
                 parent_name = parent_names.get(parent_id, "")
-                path_name = (
-                    f"{parent_name} › {name}"
-                    if parent_name
-                    else name
-                )
+                path_name = f"{parent_name} › {name}" if parent_name else name
 
             item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, category_id)
             item.setData(Qt.UserRole + 1, name)
             item.setData(Qt.UserRole + 2, parent_id)
             item.setData(Qt.UserRole + 3, path_name)
-
-            if (
-                parent_id is None
-                and category_id in parent_ids_with_children
-            ):
+            if parent_id is None and category_id in parent_ids_with_children:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
-                item.setToolTip("Dvojklikem zobrazit podkategorie")
-
+                item.setToolTip("Dvojklikem zobrazit podtagy")
             self.category_list.addItem(item)
-
-            if (
-                parent_id is not None
-                and parent_id not in self.expanded_category_ids
-            ):
+            if parent_id is not None and parent_id not in self.expanded_category_ids:
                 item.setHidden(True)
 
-            self.category_combo.addItem(path_name, category_id)
-
-            if keep_category_id == category_id:
-                selected_row = row_index
-
-        self.category_list.setCurrentRow(selected_row)
+        current_row = 0
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            if item.data(Qt.UserRole) in previous_ids:
+                item.setSelected(True)
+                if current_row == 0:
+                    current_row = row
+        self.category_list.setCurrentRow(current_row)
+        # setCurrentRow clears Ctrl selection on some Qt versions.
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            item.setSelected(item.data(Qt.UserRole) in previous_ids)
         self.category_list.blockSignals(False)
-        self.category_combo.blockSignals(False)
         self.update_category_controls()
 
+    def selected_category_ids(self) -> list[int]:
+        return [
+            int(item.data(Qt.UserRole))
+            for item in self.category_list.selectedItems()
+            if item.data(Qt.UserRole) is not None
+        ]
+
     def selected_category_id(self) -> int | None:
-        item = self.category_list.currentItem()
-        return None if item is None else item.data(Qt.UserRole)
+        tags = self.selected_category_ids()
+        return tags[0] if len(tags) == 1 else None
 
     def selected_category_name(self) -> str:
-        item = self.category_list.currentItem()
-        if item is None:
+        items = self.category_list.selectedItems()
+        if not items:
             return "Vše"
-        return str(item.data(Qt.UserRole + 3) or item.data(Qt.UserRole + 1) or "Vše")
+        names = [
+            str(item.data(Qt.UserRole + 3) or item.data(Qt.UserRole + 1))
+            for item in items
+        ]
+        return " + ".join(names) if names else "Vše"
 
     def selected_category_parent_id(self) -> int | None:
-        item = self.category_list.currentItem()
-        if item is None:
+        if len(self.category_list.selectedItems()) != 1:
             return None
+        item = self.category_list.selectedItems()[0]
         parent_id = item.data(Qt.UserRole + 2)
         return None if parent_id is None else int(parent_id)
 
@@ -2567,7 +2676,7 @@ class MainWindow(QMainWindow):
 
         rows = list(
             self.db.media_items(
-                self.selected_category_id(),
+                self.selected_category_ids(),
                 self.search_edit.text(),
             )
         )
@@ -2624,7 +2733,7 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, int(row["id"]))
             rating_text = "★" * rating if rating else "bez hodnocení"
             item.setToolTip(
-                f"Kategorie: {row['category_name']}\nHodnocení: {rating_text}"
+                f"Tagy: {row['category_name']}\nHodnocení: {rating_text}"
             )
             item.setIcon(
                 self.make_icon(
@@ -2782,10 +2891,11 @@ class MainWindow(QMainWindow):
             self.add_media_paths(files)
 
     def add_media_paths(self, paths: list[str]) -> None:
-        category_id = self.selected_category_id()
-        if category_id is None:
-            category_id = self.db.default_category_id()
-
+        tag_ids = [
+            tag_id for tag_id in self.selected_category_ids()
+            if tag_id != self.db.default_category_id()
+        ]
+        keep_id = self.selected_category_id()
         added = 0
         duplicates = 0
         unsupported = 0
@@ -2795,21 +2905,15 @@ class MainWindow(QMainWindow):
             if not path.is_file():
                 unsupported += 1
                 continue
-
             if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 unsupported += 1
                 continue
-
-            if self.db.add_media(
-                str(path),
-                detect_media_type(path),
-                int(category_id),
-            ):
+            if self.db.add_media(str(path), detect_media_type(path), tag_ids):
                 added += 1
             else:
                 duplicates += 1
 
-        self.reload_categories(category_id)
+        self.reload_categories(keep_id)
         self.reload_media()
         self._restart_file_tracker()
 
@@ -2820,15 +2924,14 @@ class MainWindow(QMainWindow):
             parts.append(f"duplicit {duplicates}")
         if unsupported:
             parts.append(f"nepodporovaných {unsupported}")
-
         message = "Média: " + ", ".join(parts) if parts else "Nebyl přidán žádný soubor."
         self.statusBar().showMessage(message, 5000)
 
     def add_category(self) -> None:
         name, ok = QInputDialog.getText(
             self,
-            "Nová kategorie",
-            "Název kategorie:",
+            "Nový tag",
+            "Název tagu:",
         )
         name = name.strip()
         if not ok or not name:
@@ -2839,14 +2942,14 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Kategorie",
-                "Kategorie s tímto názvem už existuje.",
+                "Tagy",
+                "Tag s tímto názvem už existuje.",
             )
             return
 
         self.reload_categories(category_id)
         self.reload_media()
-        self.statusBar().showMessage(f"Vytvořena kategorie „{name}“.", 3500)
+        self.statusBar().showMessage(f"Vytvořen tag „{name}“.", 3500)
 
     def add_subcategory(self, parent_id: int | None = None) -> None:
         if parent_id is None:
@@ -2860,23 +2963,23 @@ class MainWindow(QMainWindow):
         if parent["parent_id"] is not None:
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Podkategorie může být zatím jen jednu úroveň hluboko.",
+                "Podtag",
+                "Podtag může být zatím jen jednu úroveň hluboko.",
             )
             return
         if int(parent_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Do „Nezařazené“ podkategorie nepřidáváme.",
+                "Podtag",
+                "Do „Nezařazené“ nelze přidat podtag.",
             )
             return
 
         parent_name = str(parent["name"])
         name, ok = QInputDialog.getText(
             self,
-            "Nová podkategorie",
-            f"Podkategorie v „{parent_name}“:",
+            "Nový podtag",
+            f"Název podtagu v „{parent_name}“:",
         )
         name = name.strip()
         if not ok or not name:
@@ -2887,19 +2990,19 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Kategorie nebo podkategorie s tímto názvem už existuje.",
+                "Podtag",
+                "Tag nebo podtag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
-            QMessageBox.information(self, "Podkategorie", str(exc))
+            QMessageBox.information(self, "Podtag", str(exc))
             return
 
         self.expanded_category_ids.add(int(parent_id))
         self.reload_categories(category_id)
         self.reload_media()
         self.statusBar().showMessage(
-            f"Vytvořena podkategorie „{parent_name} › {name}“.",
+            f"Vytvořen podtag „{parent_name} › {name}“.",
             3500,
         )
 
@@ -2916,14 +3019,14 @@ class MainWindow(QMainWindow):
         if int(category_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Kategorie",
-                "Kategorie „Nezařazené“ má pevný název.",
+                "Tagy",
+                "Tag „Nezařazené“ má pevný název.",
             )
             return
 
         name, ok = QInputDialog.getText(
             self,
-            "Přejmenovat kategorii",
+            "Přejmenovat tag",
             "Nový název:",
             text=current_name,
         )
@@ -2936,18 +3039,18 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Kategorie",
-                "Kategorie s tímto názvem už existuje.",
+                "Tagy",
+                "Tag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
-            QMessageBox.information(self, "Kategorie", str(exc))
+            QMessageBox.information(self, "Tagy", str(exc))
             return
 
         self.reload_categories(int(category_id))
         self.reload_media()
         self.statusBar().showMessage(
-            f"Kategorie přejmenována na „{name}“.",
+            f"Tag přejmenován na „{name}“.",
             3500,
         )
 
@@ -2969,21 +3072,21 @@ class MainWindow(QMainWindow):
         if category_id is None:
             return
 
-        name = str(item.data(Qt.UserRole + 1) or "kategorii")
+        name = str(item.data(Qt.UserRole + 1) or "tag")
 
         if int(category_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Kategorie",
-                "Výchozí kategorii „Nezařazené“ nelze smazat.",
+                "Tagy",
+                "Výchozí tag „Nezařazené“ nelze smazat.",
             )
             return
 
         answer = QMessageBox.question(
             self,
-            "Smazat kategorii",
-            f"Smazat kategorii „{name}“?\n\n"
-            "Média z ní se přesunou do „Nezařazené“. "
+            "Smazat tag",
+            f"Smazat tag „{name}“?\n\n"
+            "Tag se odebere ze všech médií. Ostatní tagy zůstanou zachované. "
             "Původní soubory v počítači zůstanou beze změny.",
         )
         if answer != QMessageBox.Yes:
@@ -2993,25 +3096,25 @@ class MainWindow(QMainWindow):
             self.db.delete_category(int(category_id))
             self.expanded_category_ids.discard(int(category_id))
         except ValueError as exc:
-            QMessageBox.information(self, "Kategorie", str(exc))
+            QMessageBox.information(self, "Tagy", str(exc))
             return
 
         default_id = self.db.default_category_id()
         self.reload_categories(default_id)
         self.reload_media()
-        self.statusBar().showMessage(f"Kategorie „{name}“ smazána.", 3500)
+        self.statusBar().showMessage(f"Tag „{name}“ smazán.", 3500)
 
     def show_category_context_menu(self, pos) -> None:
         menu = QMenu(self)
 
-        new_action = menu.addAction("Nová kategorie")
-        new_subcategory_action = menu.addAction("Nová podkategorie")
+        new_action = menu.addAction("Nový tag")
+        new_subcategory_action = menu.addAction("Nový podtag")
         rename_action = menu.addAction("Přejmenovat")
         menu.addSeparator()
         up_action = menu.addAction("Posunout nahoru")
         down_action = menu.addAction("Posunout dolů")
         menu.addSeparator()
-        delete_action = menu.addAction("Smazat kategorii")
+        delete_action = menu.addAction("Smazat tag")
 
         category_id = self.selected_category_id()
         is_real = category_id is not None
@@ -3045,7 +3148,24 @@ class MainWindow(QMainWindow):
         elif chosen == delete_action:
             self.delete_category()
 
-    def on_category_changed(self, current, previous) -> None:
+    def on_category_changed(self) -> None:
+        # Smart views Vše and Nezařazené cannot be combined with actual tags.
+        chosen = self.category_list.selectedItems()
+        if len(chosen) > 1:
+            current = self.category_list.currentItem()
+            current_id = None if current is None else current.data(Qt.UserRole)
+            default_id = self.db.default_category_id()
+            self.category_list.blockSignals(True)
+            if current is not None and current_id in (None, default_id):
+                for item in chosen:
+                    if item is not current:
+                        item.setSelected(False)
+            else:
+                for item in chosen:
+                    if item.data(Qt.UserRole) in (None, default_id):
+                        item.setSelected(False)
+            self.category_list.blockSignals(False)
+
         self.search_edit.blockSignals(True)
         self.type_filter_combo.blockSignals(True)
         try:
@@ -3054,7 +3174,6 @@ class MainWindow(QMainWindow):
         finally:
             self.search_edit.blockSignals(False)
             self.type_filter_combo.blockSignals(False)
-
         self.update_category_controls()
         self.reload_media(select_media_id=None)
 
@@ -3084,9 +3203,11 @@ class MainWindow(QMainWindow):
             self.notes_edit.setReadOnly(True)
             self.notes_edit.setPlainText(row["notes"])
 
-            combo_index = self.category_combo.findData(int(row["category_id"]))
-            if combo_index >= 0:
-                self.category_combo.setCurrentIndex(combo_index)
+            self.selected_detail_tag_ids = set(
+                self.db.tags_for_media(int(row["id"]))
+            )
+            self._rebuild_detail_tag_menu()
+            self.detail_tag_button.setEnabled(True)
 
             self.current_rating = max(0, min(3, int(row["rating"] or 0)))
             for button in self.rating_buttons:
@@ -3096,7 +3217,7 @@ class MainWindow(QMainWindow):
             self.loaded_detail_state = (
                 str(row["caption"]),
                 str(row["notes"]),
-                int(row["category_id"]),
+                tuple(sorted(self.selected_detail_tag_ids)),
                 self.current_rating,
             )
 
@@ -3112,18 +3233,56 @@ class MainWindow(QMainWindow):
 
         self._update_save_button_state()
 
-    def _current_detail_state(self) -> tuple[str, str, int, int] | None:
+    def _rebuild_detail_tag_menu(self) -> None:
+        self.detail_tags_menu.clear()
+        default_id = self.db.default_category_id()
+        for row in self.db.categories():
+            tag_id = int(row["id"])
+            if tag_id == default_id:
+                continue
+            action = self.detail_tags_menu.addAction(
+                self.db.category_path_name(tag_id)
+            )
+            action.setCheckable(True)
+            action.setChecked(tag_id in self.selected_detail_tag_ids)
+            action.triggered.connect(
+                lambda checked, selected_id=tag_id:
+                    self.toggle_detail_tag(selected_id, checked)
+            )
+        self._refresh_detail_tag_label()
+
+    def _refresh_detail_tag_label(self) -> None:
+        names = [
+            self.db.category_path_name(tag_id)
+            for tag_id in sorted(self.selected_detail_tag_ids)
+        ]
+        summary = ", ".join(names)
+        if len(names) > 2:
+            summary = ", ".join(names[:2]) + f" (+{len(names) - 2})"
+        self.detail_tag_button.setText(summary or "Bez tagů")
+        self.detail_tag_button.setToolTip(
+            ", ".join(names) if names else "Médium nemá žádné tagy"
+        )
+
+    def toggle_detail_tag(self, tag_id: int, checked: bool) -> None:
+        if self.current_media_id is None:
+            return
+        if checked:
+            self.selected_detail_tag_ids.add(tag_id)
+        else:
+            self.selected_detail_tag_ids.discard(tag_id)
+        self._refresh_detail_tag_label()
+        self._on_detail_edited()
+
+    def _current_detail_state(
+        self,
+    ) -> tuple[str, str, tuple[int, ...], int] | None:
         if self.current_media_id is None:
             return None
-
-        category_id = self.category_combo.currentData()
-        if category_id is None:
-            return None
-
         return (
             self.caption_edit.text(),
             self.notes_edit.toPlainText(),
-            int(category_id),
+            tuple(sorted(self.selected_detail_tag_ids)),
             int(self.current_rating),
         )
 
@@ -3191,7 +3350,7 @@ class MainWindow(QMainWindow):
                     else "bez hodnocení"
                 )
                 item.setToolTip(
-                    f"Kategorie: {row['category_name']}\n"
+                    f"Tagy: {row['category_name']}\n"
                     f"Hodnocení: {rating_text}"
                 )
 
@@ -3424,10 +3583,6 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        category_id = self.category_combo.currentData()
-        if category_id is None:
-            return
-
         media_id = self.current_media_id
         selected_category = self.selected_category_id()
         caption = self.caption_edit.text()
@@ -3437,15 +3592,14 @@ class MainWindow(QMainWindow):
             media_id,
             caption.strip(),
             notes.strip(),
-            int(category_id),
+            sorted(self.selected_detail_tag_ids),
             int(self.current_rating),
         )
-
         self.reload_categories(selected_category)
         self.reload_media(select_media_id=media_id)
 
         row = self.db.media_by_id(media_id)
-        if row is not None:
+        if row is not None and self.current_media_id == media_id:
             self.current_rating = max(0, min(3, int(row["rating"] or 0)))
             self._refresh_rating_buttons()
             self.notes_edit.setReadOnly(True)
@@ -3453,7 +3607,7 @@ class MainWindow(QMainWindow):
             self.loaded_detail_state = (
                 str(row["caption"]),
                 str(row["notes"]),
-                int(row["category_id"]),
+                tuple(sorted(self.db.tags_for_media(media_id))),
                 self.current_rating,
             )
 
@@ -3482,20 +3636,29 @@ class MainWindow(QMainWindow):
         self.rate_media_ids(media_ids, rating)
 
     def move_media_ids_to(
-        self,
-        media_ids: list[int],
-        category_id: int,
+        self, media_ids: list[int], category_id: int
+    ) -> None:
+        if not media_ids or category_id == self.db.default_category_id():
+            return
+        current = self.current_media_id
+        self.db.add_media_tags(media_ids, [category_id])
+        self.reload_categories(self.selected_category_id())
+        self.reload_media(select_media_id=current)
+        self.statusBar().showMessage(
+            f"Tag přidán k {len(media_ids)} položkám.", 3500
+        )
+
+    def remove_tag_from_media_ids(
+        self, media_ids: list[int], category_id: int
     ) -> None:
         if not media_ids:
             return
-
-        source_category_id = self.selected_category_id()
-        self.db.move_media(media_ids, category_id)
-        self.reload_categories(source_category_id)
-        self.reload_media(select_media_id=None)
+        current = self.current_media_id
+        self.db.remove_media_tags(media_ids, [category_id])
+        self.reload_categories(self.selected_category_id())
+        self.reload_media(select_media_id=current)
         self.statusBar().showMessage(
-            f"Přesunuto {len(media_ids)} položek.",
-            3500,
+            f"Tag odebrán u {len(media_ids)} položek.", 3500
         )
 
     def move_selected_media_to(self, category_id: int) -> None:
@@ -3554,6 +3717,7 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         open_action = menu.addAction("Otevřít původní soubor")
+        reveal_action = menu.addAction("Zobrazit umístění souboru")
 
         rating_title = (
             f"Hodnocení ({len(selected_ids)} položek)"
@@ -3574,17 +3738,23 @@ class MainWindow(QMainWindow):
                     self.rate_media_ids(list(ids), rating)
             )
 
-        move_menu = menu.addMenu("Přesunout do kategorie")
+        add_tag_menu = menu.addMenu("Přidat tag")
+        remove_tag_menu = menu.addMenu("Odebrat tag")
         frozen_move_ids = tuple(selected_ids)
-
         for row in self.db.categories():
             category_id = int(row["id"])
-            action = move_menu.addAction(
-                self.db.category_path_name(category_id)
-            )
-            action.triggered.connect(
+            if category_id == self.db.default_category_id():
+                continue
+            tag_name = self.db.category_path_name(category_id)
+            add_action = add_tag_menu.addAction(tag_name)
+            add_action.triggered.connect(
                 lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
                     self.move_media_ids_to(list(ids), target_id)
+            )
+            remove_action = remove_tag_menu.addAction(tag_name)
+            remove_action.triggered.connect(
+                lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
+                    self.remove_tag_from_media_ids(list(ids), target_id)
             )
 
         menu.addSeparator()
@@ -3593,6 +3763,8 @@ class MainWindow(QMainWindow):
         chosen = menu.exec(self.media_list.mapToGlobal(pos))
         if chosen == open_action:
             self.open_current()
+        elif chosen == reveal_action:
+            self.open_current_path()
         elif chosen == delete_action:
             self.delete_selected_media()
 
@@ -3710,6 +3882,10 @@ class MainWindow(QMainWindow):
         self.current_preview_type = None
         self.current_rating = 0
         self.loaded_detail_state = None
+        self.selected_detail_tag_ids.clear()
+        self.detail_tag_button.setEnabled(False)
+        self.detail_tags_menu.clear()
+        self._refresh_detail_tag_label()
         self.save_feedback_active = False
 
         if self.current_movie is not None:
