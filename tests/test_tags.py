@@ -159,6 +159,80 @@ class TagsDatabaseTests(unittest.TestCase):
         window.save_current()
         self.assertEqual(set(db.tags_for_media(window.current_media_id)), {popular, rare})
 
+    def test_create_five_tags_at_once_and_skip_duplicates(self):
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        db.add_category("Původní")
+        created, duplicates = db.add_categories_batch([
+            "  Jeden  ", "Dva", "Tři", "Čtyři", "Pět",
+            "jeden", "PŮVODNÍ", "", "   ",
+        ])
+        self.assertEqual(len(created), 5)
+        self.assertEqual(duplicates, ["jeden", "PŮVODNÍ"])
+        rows = db.categories()
+        names = [row["name"] for row in rows if row["parent_id"] is None]
+        self.assertEqual(
+            names[-5:], ["Jeden", "Dva", "Tři", "Čtyři", "Pět"],
+        )
+        self.assertEqual(
+            len({str(row["name"]).casefold() for row in rows}), len(rows)
+        )
+
+    def test_create_multiple_subtags_at_once(self):
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        parent = db.add_category("Rodič")
+        created, duplicates = db.add_categories_batch(
+            ["Podtag 1", "Podtag 2", "Podtag 3"], parent
+        )
+        self.assertEqual(len(created), 3)
+        self.assertEqual(duplicates, [])
+        self.assertEqual(
+            [db.category_by_id(tag_id)["parent_id"] for tag_id in created],
+            [parent, parent, parent],
+        )
+        with self.assertRaisesRegex(ValueError, "jednu úroveň"):
+            db.add_categories_batch(["Nepovolený"], created[0])
+        self.assertFalse(
+            any(row["name"] == "Nepovolený" for row in db.categories())
+        )
+
+    def test_multiline_dialog_creates_tags_in_one_action(self):
+        from unittest.mock import patch
+        from PySide6.QtWidgets import QApplication
+
+        main.DB_PATH = self.path
+        app = QApplication.instance() or QApplication([])
+        window = main.MainWindow()
+        self.addCleanup(window.close)
+        self.addCleanup(window.db.conn.close)
+
+        with patch.object(
+            main.QInputDialog,
+            "getMultiLineText",
+            return_value=("A\nB\nC\nD\nE", True),
+        ) as dialog:
+            window.add_category()
+            dialog.assert_called_once()
+        names = {row["name"] for row in window.db.categories()}
+        self.assertTrue({"A", "B", "C", "D", "E"}.issubset(names))
+        parent = next(
+            int(row["id"]) for row in window.db.categories()
+            if row["name"] == "A"
+        )
+        with patch.object(
+            main.QInputDialog,
+            "getMultiLineText",
+            return_value=("Pod 1\nPod 2", True),
+        ) as dialog:
+            window.add_subcategory(parent_id=parent)
+            dialog.assert_called_once()
+        children = [
+            row["name"] for row in window.db.categories()
+            if row["parent_id"] == parent
+        ]
+        self.assertEqual(children, ["Pod 1", "Pod 2"])
+
     def test_legacy_category_migration_and_backup(self):
         with sqlite3.connect(self.path) as conn:
             conn.executescript("""

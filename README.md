@@ -1,4 +1,4 @@
-# Zobrazovač v0.9.15
+# Zobrazovač v0.9.17
 
 Desktopová aplikace pro vlastní knihovnu obrázků, GIFů a videí s popisky, poznámkami, hodnocením a **tagy**.
 
@@ -9,6 +9,9 @@ Desktopová aplikace pro vlastní knihovnu obrázků, GIFů a videí s popisky, 
 - **Ctrl + kliknutí** na další tagy filtruje jejich průnik (médium musí mít všechny vybrané tagy).
 - „Vše“ zobrazuje celou knihovnu a „Nezařazené“ jen média bez tagu.
 - Podtagy a ruční pořadí tagů zůstávají zachovány.
+- **Hromadné vytváření tagů:** klikni na **+**, napiš více názvů (každý na samostatný řádek) a potvrď. Funguje také pro **Nový podtag**.
+- Existující názvy se přeskočí a program upozorní na duplicity. Ostatní zadané tagy se vytvoří najednou.
+- Při přiřazování tagů lze zaškrtnout více položek bez zavření nabídky. Tagy v nabídce jsou seřazené podle počtu médií.
 - Po výběru média lze tagy přiřazovat a odebírat vpravo tlačítkem **Tagy** a uložit přes **Uložit změny**.
 - Pravým kliknutím na náhled je možné přidávat nebo odebírat tagy také více vybraným médiím najednou.
 - Pravé tlačítko nad náhledem nabízí **Zobrazit umístění souboru**.
