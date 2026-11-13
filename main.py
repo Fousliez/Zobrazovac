@@ -1701,7 +1701,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(notebook_separator)
 
         sidebar_header = QHBoxLayout()
-        category_heading = QLabel("Kategorie")
+        category_heading = QLabel("Tagy")
         category_heading.setObjectName("sectionTitle")
         sidebar_header.addWidget(category_heading)
         sidebar_header.addStretch()
@@ -1715,6 +1715,10 @@ class MainWindow(QMainWindow):
 
         self.category_list = QListWidget()
         self.category_list.setObjectName("categoryList")
+        self.category_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.category_list.setToolTip(
+            "Kliknutí: jeden tag. Ctrl + kliknutí: kombinace více tagů."
+        )
         self.category_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.category_list.setSpacing(2)
         self.category_list.setItemDelegate(CategoryDelegate(self.category_list))
@@ -2001,7 +2005,7 @@ class MainWindow(QMainWindow):
         self.category_up_btn.clicked.connect(lambda: self.move_category(-1))
         self.category_down_btn.clicked.connect(lambda: self.move_category(1))
 
-        self.category_list.currentItemChanged.connect(self.on_category_changed)
+        self.category_list.itemSelectionChanged.connect(self.on_category_changed)
         self.category_list.itemDoubleClicked.connect(
             self.toggle_category_expanded
         )
@@ -2527,13 +2531,16 @@ class MainWindow(QMainWindow):
         self.save_current()
 
     def reload_categories(self, keep_category_id: int | None = None) -> None:
-        if keep_category_id is None:
-            keep_category_id = self.selected_category_id()
+        previous_ids = {
+            item.data(Qt.UserRole) for item in self.category_list.selectedItems()
+        }
+        if not previous_ids:
+            previous_ids = {None}
+        if keep_category_id is not None and keep_category_id not in previous_ids:
+            previous_ids = {keep_category_id}
 
         self.category_list.blockSignals(True)
-        self.category_combo.blockSignals(True)
         self.category_list.clear()
-        self.category_combo.clear()
 
         total = self.db.total_media_count()
         all_item = QListWidgetItem(f"Vše  ·  {total}")
@@ -2545,88 +2552,85 @@ class MainWindow(QMainWindow):
         all_item.setSizeHint(QSize(all_item.sizeHint().width(), 34))
         self.category_list.addItem(all_item)
 
-        selected_row = 0
         rows = self.db.categories()
         parent_names = {
             int(row["id"]): str(row["name"])
-            for row in rows
-            if row["parent_id"] is None
+            for row in rows if row["parent_id"] is None
         }
         parent_ids_with_children = {
             int(row["parent_id"])
-            for row in rows
-            if row["parent_id"] is not None
+            for row in rows if row["parent_id"] is not None
         }
 
-        for row_index, row in enumerate(rows, start=1):
+        for row in rows:
             category_id = int(row["id"])
             name = str(row["name"])
             count = int(row["media_count"])
             parent_id = (
-                None
-                if row["parent_id"] is None
-                else int(row["parent_id"])
+                None if row["parent_id"] is None else int(row["parent_id"])
             )
-
             if parent_id is None:
                 display_text = f"{name}  ·  {count}"
                 path_name = name
             else:
                 display_text = f"    {name}  ·  {count}"
                 parent_name = parent_names.get(parent_id, "")
-                path_name = (
-                    f"{parent_name} › {name}"
-                    if parent_name
-                    else name
-                )
+                path_name = f"{parent_name} › {name}" if parent_name else name
 
             item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, category_id)
             item.setData(Qt.UserRole + 1, name)
             item.setData(Qt.UserRole + 2, parent_id)
             item.setData(Qt.UserRole + 3, path_name)
-
-            if (
-                parent_id is None
-                and category_id in parent_ids_with_children
-            ):
+            if parent_id is None and category_id in parent_ids_with_children:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
-                item.setToolTip("Dvojklikem zobrazit podkategorie")
-
+                item.setToolTip("Dvojklikem zobrazit podtagy")
             self.category_list.addItem(item)
-
-            if (
-                parent_id is not None
-                and parent_id not in self.expanded_category_ids
-            ):
+            if parent_id is not None and parent_id not in self.expanded_category_ids:
                 item.setHidden(True)
 
-            self.category_combo.addItem(path_name, category_id)
-
-            if keep_category_id == category_id:
-                selected_row = row_index
-
-        self.category_list.setCurrentRow(selected_row)
+        current_row = 0
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            if item.data(Qt.UserRole) in previous_ids:
+                item.setSelected(True)
+                if current_row == 0:
+                    current_row = row
+        self.category_list.setCurrentRow(current_row)
+        # setCurrentRow clears Ctrl selection on some Qt versions.
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            item.setSelected(item.data(Qt.UserRole) in previous_ids)
         self.category_list.blockSignals(False)
-        self.category_combo.blockSignals(False)
         self.update_category_controls()
 
+    def selected_category_ids(self) -> list[int]:
+        return [
+            int(item.data(Qt.UserRole))
+            for item in self.category_list.selectedItems()
+            if item.data(Qt.UserRole) is not None
+        ]
+
     def selected_category_id(self) -> int | None:
-        item = self.category_list.currentItem()
-        return None if item is None else item.data(Qt.UserRole)
+        tags = self.selected_category_ids()
+        return tags[0] if len(tags) == 1 else None
 
     def selected_category_name(self) -> str:
-        item = self.category_list.currentItem()
-        if item is None:
+        items = self.category_list.selectedItems()
+        if not items:
             return "Vše"
-        return str(item.data(Qt.UserRole + 3) or item.data(Qt.UserRole + 1) or "Vše")
+        names = [
+            str(item.data(Qt.UserRole + 3) or item.data(Qt.UserRole + 1))
+            for item in items
+        ]
+        return " + ".join(names) if names else "Vše"
 
     def selected_category_parent_id(self) -> int | None:
-        item = self.category_list.currentItem()
-        if item is None:
+        if len(self.category_list.selectedItems()) != 1:
             return None
+        item = self.category_list.selectedItems()[0]
         parent_id = item.data(Qt.UserRole + 2)
         return None if parent_id is None else int(parent_id)
 
@@ -2668,7 +2672,7 @@ class MainWindow(QMainWindow):
 
         rows = list(
             self.db.media_items(
-                self.selected_category_id(),
+                self.selected_category_ids(),
                 self.search_edit.text(),
             )
         )
@@ -2883,10 +2887,11 @@ class MainWindow(QMainWindow):
             self.add_media_paths(files)
 
     def add_media_paths(self, paths: list[str]) -> None:
-        category_id = self.selected_category_id()
-        if category_id is None:
-            category_id = self.db.default_category_id()
-
+        tag_ids = [
+            tag_id for tag_id in self.selected_category_ids()
+            if tag_id != self.db.default_category_id()
+        ]
+        keep_id = self.selected_category_id()
         added = 0
         duplicates = 0
         unsupported = 0
@@ -2896,21 +2901,15 @@ class MainWindow(QMainWindow):
             if not path.is_file():
                 unsupported += 1
                 continue
-
             if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 unsupported += 1
                 continue
-
-            if self.db.add_media(
-                str(path),
-                detect_media_type(path),
-                int(category_id),
-            ):
+            if self.db.add_media(str(path), detect_media_type(path), tag_ids):
                 added += 1
             else:
                 duplicates += 1
 
-        self.reload_categories(category_id)
+        self.reload_categories(keep_id)
         self.reload_media()
         self._restart_file_tracker()
 
@@ -2921,7 +2920,6 @@ class MainWindow(QMainWindow):
             parts.append(f"duplicit {duplicates}")
         if unsupported:
             parts.append(f"nepodporovaných {unsupported}")
-
         message = "Média: " + ", ".join(parts) if parts else "Nebyl přidán žádný soubor."
         self.statusBar().showMessage(message, 5000)
 
@@ -3146,7 +3144,24 @@ class MainWindow(QMainWindow):
         elif chosen == delete_action:
             self.delete_category()
 
-    def on_category_changed(self, current, previous) -> None:
+    def on_category_changed(self) -> None:
+        # Smart views Vše and Nezařazené cannot be combined with actual tags.
+        chosen = self.category_list.selectedItems()
+        if len(chosen) > 1:
+            current = self.category_list.currentItem()
+            current_id = None if current is None else current.data(Qt.UserRole)
+            default_id = self.db.default_category_id()
+            self.category_list.blockSignals(True)
+            if current is not None and current_id in (None, default_id):
+                for item in chosen:
+                    if item is not current:
+                        item.setSelected(False)
+            else:
+                for item in chosen:
+                    if item.data(Qt.UserRole) in (None, default_id):
+                        item.setSelected(False)
+            self.category_list.blockSignals(False)
+
         self.search_edit.blockSignals(True)
         self.type_filter_combo.blockSignals(True)
         try:
@@ -3155,7 +3170,6 @@ class MainWindow(QMainWindow):
         finally:
             self.search_edit.blockSignals(False)
             self.type_filter_combo.blockSignals(False)
-
         self.update_category_controls()
         self.reload_media(select_media_id=None)
 
