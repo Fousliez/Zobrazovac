@@ -210,7 +210,7 @@ class TagsDatabaseTests(unittest.TestCase):
         with patch.object(
             main.QInputDialog,
             "getMultiLineText",
-            return_value=("A\\nB\\nC\\nD\\nE", True),
+            return_value=("A\nB\nC\nD\nE", True),
         ) as dialog:
             window.add_category()
             dialog.assert_called_once()
@@ -223,7 +223,7 @@ class TagsDatabaseTests(unittest.TestCase):
         with patch.object(
             main.QInputDialog,
             "getMultiLineText",
-            return_value=("Pod 1\\nPod 2", True),
+            return_value=("Pod 1\nPod 2", True),
         ) as dialog:
             window.add_subcategory(parent_id=parent)
             dialog.assert_called_once()
