@@ -108,6 +108,57 @@ class TagsDatabaseTests(unittest.TestCase):
         self.assertEqual(window.selected_category_ids(), [b])
         self.assertEqual(window.media_list.count(), 1)
 
+    def test_picker_stays_open_and_sorts_by_number_of_media(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QCheckBox
+
+        db = main.Database(self.path)
+        self.addCleanup(db.conn.close)
+        popular = db.add_category("Oblíbený")
+        common = db.add_category("Běžný")
+        rare = db.add_category("Vzácný")
+        db.add_media(str(self.make_file("first.jpg")), "image", [popular])
+        db.add_media(str(self.make_file("second.jpg")), "image", [popular, common])
+        db.add_media(str(self.make_file("third.jpg")), "image", [popular, common])
+        main.DB_PATH = self.path
+
+        app = QApplication.instance() or QApplication([])
+        window = main.MainWindow()
+        self.addCleanup(window.close)
+        self.addCleanup(window.db.conn.close)
+        window.show()
+        app.processEvents()
+
+        menu = window.detail_tags_menu
+        widgets = [
+            action.defaultWidget() for action in menu.actions()
+            if action.defaultWidget() is not None
+        ]
+        self.assertTrue(all(isinstance(w, QCheckBox) for w in widgets))
+        self.assertEqual(
+            [w.text() for w in widgets],
+            ["Oblíbený  ·  3", "Běžný  ·  2", "Vzácný  ·  0"],
+        )
+        self.assertEqual(window.current_media_id, int(db.media_items()[0]["id"]))
+        menu.popup(QPoint(150, 100))
+        app.processEvents()
+        self.assertTrue(menu.isVisible())
+
+        # Click several checkboxes WITHOUT closing/reopening the menu.
+        QTest.mouseClick(widgets[2], Qt.LeftButton)
+        app.processEvents()
+        self.assertTrue(menu.isVisible())
+        self.assertIn(rare, window.selected_detail_tag_ids)
+        QTest.mouseClick(widgets[1], Qt.LeftButton)
+        app.processEvents()
+        self.assertTrue(menu.isVisible())
+        self.assertNotIn(common, window.selected_detail_tag_ids)
+
+        menu.hide()
+        window.save_current()
+        self.assertEqual(set(db.tags_for_media(window.current_media_id)), {popular, rare})
+
     def test_legacy_category_migration_and_backup(self):
         with sqlite3.connect(self.path) as conn:
             conn.executescript("""
