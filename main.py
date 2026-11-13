@@ -52,7 +52,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-APP_VERSION = "0.9.14"
+APP_VERSION = "0.9.15"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -150,6 +150,7 @@ def video_thumbnail_path(media_id: int) -> Path:
 class Database:
     def __init__(self, path: Path):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.db_path = path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self._create_schema()
@@ -238,6 +239,40 @@ class Database:
                     f"ALTER TABLE media ADD COLUMN {name} {sql_type}"
                 )
 
+        # Migrate legacy assignments exactly once; keep a local backup.
+        migrated = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_tags'"
+        ).fetchone() is not None
+        self.conn.commit()
+        if not migrated:
+            if self.conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]:
+                backup_path = self.db_path.with_name("media_notes.before_tags.db")
+                if not backup_path.exists():
+                    with sqlite3.connect(backup_path) as backup:
+                        self.conn.backup(backup)
+            self.conn.execute(
+                """
+                CREATE TABLE media_tags (
+                    media_id INTEGER NOT NULL,
+                    category_id INTEGER NOT NULL,
+                    PRIMARY KEY (media_id, category_id),
+                    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE,
+                    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO media_tags(media_id, category_id)
+                SELECT m.id, m.category_id
+                FROM media m
+                JOIN categories c ON c.id = m.category_id
+                WHERE c.name != 'Nezařazené' COLLATE NOCASE
+                """
+            )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(category_id)"
+        )
         self.conn.commit()
 
     def _backfill_media_identity(self) -> None:
@@ -337,15 +372,17 @@ class Database:
         rows = self.conn.execute(
             """
             SELECT
-                c.id,
-                c.name,
-                c.sort_order,
-                c.parent_id,
-                COUNT(m.id) AS media_count
+                c.id, c.name, c.sort_order, c.parent_id,
+                CASE WHEN c.id = ? THEN (
+                    SELECT COUNT(*) FROM media m WHERE NOT EXISTS (
+                        SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id
+                    )
+                ) ELSE (
+                    SELECT COUNT(*) FROM media_tags mt WHERE mt.category_id = c.id
+                ) END AS media_count
             FROM categories c
-            LEFT JOIN media m ON m.category_id = c.id
-            GROUP BY c.id, c.name, c.sort_order, c.parent_id
-            """
+            """,
+            (self.default_category_id(),),
         ).fetchall()
 
         parents = sorted(
@@ -357,7 +394,6 @@ class Database:
             if row["parent_id"] is None:
                 continue
             children_by_parent.setdefault(int(row["parent_id"]), []).append(row)
-
         ordered = []
         for parent in parents:
             ordered.append(parent)
@@ -366,7 +402,6 @@ class Database:
                 key=lambda row: (int(row["sort_order"]), int(row["id"]))
             )
             ordered.extend(children)
-
         return ordered
 
     def category_by_id(self, category_id: int):
@@ -511,13 +546,19 @@ class Database:
     def delete_category(self, category_id: int) -> None:
         default_id = self.default_category_id()
         if category_id == default_id:
-            raise ValueError("Výchozí kategorii „Nezařazené“ nelze smazat.")
+            raise ValueError("Výchozí položku „Nezařazené“ nelze smazat.")
         if self.has_subcategories(category_id):
-            raise ValueError(
-                "Kategorie obsahuje podkategorie. "
-                "Nejdřív smaž její podkategorie."
-            )
+            raise ValueError("Tag obsahuje podtagy. Nejdřív smaž jeho podtagy.")
 
+        affected = self.conn.execute(
+            "SELECT media_id FROM media_tags WHERE category_id = ?",
+            (category_id,),
+        ).fetchall()
+        self.conn.execute(
+            "DELETE FROM media_tags WHERE category_id = ?", (category_id,)
+        )
+        for row in affected:
+            self._sync_primary_category(int(row["media_id"]))
         self.conn.execute(
             "UPDATE media SET category_id = ? WHERE category_id = ?",
             (default_id, category_id),
@@ -526,7 +567,7 @@ class Database:
         self.conn.commit()
         self._normalize_category_order()
 
-    def add_media(self, path: str, media_type: str, category_id: int) -> bool:
+    def add_media(self, path: str, media_type: str, category_ids: list[int]) -> bool:
         normalized = normalized_path(path)
         exists = self.conn.execute(
             "SELECT id FROM media WHERE path = ? LIMIT 1",
@@ -535,30 +576,26 @@ class Database:
         if exists is not None:
             return False
 
+        default_id = self.default_category_id()
+        tag_ids = sorted({int(i) for i in category_ids if int(i) != default_id})
         file_path = Path(normalized)
         device, inode, size, fingerprint = file_identity(file_path)
-        self.conn.execute(
+        cursor = self.conn.execute(
             """
             INSERT INTO media(
-                path,
-                media_type,
-                category_id,
-                file_device,
-                file_inode,
-                file_size,
-                fingerprint
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                path, media_type, category_id, file_device, file_inode,
+                file_size, fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                normalized,
-                media_type,
-                category_id,
-                device,
-                inode,
-                size,
-                fingerprint,
+                normalized, media_type,
+                tag_ids[0] if tag_ids else default_id,
+                device, inode, size, fingerprint,
             ),
+        )
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+            [(int(cursor.lastrowid), category_id) for category_id in tag_ids],
         )
         self.conn.commit()
         return True
@@ -641,63 +678,133 @@ class Database:
             updated.append(int(row["id"]))
         return updated
 
-    def media_items(self, category_id: int | None = None, search: str = ""):
+    def media_items(self, category_ids: list[int] | None = None, search: str = ""):
         query = """
-            SELECT m.*, c.name AS category_name
-            FROM media m
-            JOIN categories c ON c.id = m.category_id
-            WHERE 1 = 1
+            SELECT m.*, COALESCE((
+                SELECT GROUP_CONCAT(c.name, ', ')
+                FROM media_tags mt JOIN categories c ON c.id = mt.category_id
+                WHERE mt.media_id = m.id
+            ), 'Bez tagů') AS category_name
+            FROM media m WHERE 1 = 1
         """
         params: list[object] = []
-
-        if category_id is not None:
-            query += " AND m.category_id = ?"
-            params.append(category_id)
+        tags = list(dict.fromkeys(category_ids or []))
+        if tags:
+            if self.default_category_id() in tags:
+                query += """
+                    AND NOT EXISTS (
+                        SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id
+                    )
+                """
+            else:
+                placeholders = ",".join("?" for _ in tags)
+                query += f"""
+                    AND m.id IN (
+                        SELECT mt.media_id FROM media_tags mt
+                        WHERE mt.category_id IN ({placeholders})
+                        GROUP BY mt.media_id
+                        HAVING COUNT(DISTINCT mt.category_id) = ?
+                    )
+                """
+                params.extend([*tags, len(tags)])
 
         if search.strip():
             needle = f"%{search.strip()}%"
             query += """
                 AND (
-                    m.caption LIKE ?
-                    OR m.notes LIKE ?
-                    OR m.path LIKE ?
-                    OR c.name LIKE ?
+                    m.caption LIKE ? OR m.notes LIKE ? OR m.path LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM media_tags mt
+                        JOIN categories c ON c.id = mt.category_id
+                        WHERE mt.media_id = m.id AND c.name LIKE ?
+                    )
                 )
             """
             params.extend([needle, needle, needle, needle])
-
         query += " ORDER BY m.id DESC"
         return self.conn.execute(query, params).fetchall()
 
     def media_by_id(self, media_id: int):
         return self.conn.execute(
             """
-            SELECT m.*, c.name AS category_name
-            FROM media m
-            JOIN categories c ON c.id = m.category_id
-            WHERE m.id = ?
+            SELECT m.*, COALESCE((
+                SELECT GROUP_CONCAT(c.name, ', ')
+                FROM media_tags mt JOIN categories c ON c.id = mt.category_id
+                WHERE mt.media_id = m.id
+            ), 'Bez tagů') AS category_name
+            FROM media m WHERE m.id = ?
             """,
             (media_id,),
         ).fetchone()
 
+    def tags_for_media(self, media_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT category_id FROM media_tags WHERE media_id = ?",
+            (media_id,),
+        ).fetchall()
+        return [int(row["category_id"]) for row in rows]
+
+    def _sync_primary_category(self, media_id: int) -> None:
+        row = self.conn.execute(
+            "SELECT MIN(category_id) AS id FROM media_tags WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+        category_id = (
+            int(row["id"]) if row["id"] is not None
+            else self.default_category_id()
+        )
+        self.conn.execute(
+            "UPDATE media SET category_id = ? WHERE id = ?",
+            (category_id, media_id),
+        )
+
+    def replace_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        default_id = self.default_category_id()
+        tags = sorted({int(tag_id) for tag_id in tag_ids if int(tag_id) != default_id})
+        for media_id in media_ids:
+            self.conn.execute(
+                "DELETE FROM media_tags WHERE media_id = ?", (media_id,)
+            )
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+                [(media_id, category_id) for category_id in tags],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
+    def add_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        tags = {int(tag_id) for tag_id in tag_ids}
+        tags.discard(self.default_category_id())
+        for media_id in media_ids:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO media_tags(media_id, category_id) VALUES (?, ?)",
+                [(media_id, category_id) for category_id in tags],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
+    def remove_media_tags(self, media_ids: list[int], tag_ids: list[int]) -> None:
+        for media_id in media_ids:
+            self.conn.executemany(
+                "DELETE FROM media_tags WHERE media_id = ? AND category_id = ?",
+                [(media_id, category_id) for category_id in tag_ids],
+            )
+            self._sync_primary_category(media_id)
+        self.conn.commit()
+
     def update_media(
-        self,
-        media_id: int,
-        caption: str,
-        notes: str,
-        category_id: int,
-        rating: int,
+        self, media_id: int, caption: str, notes: str,
+        tag_ids: list[int], rating: int,
     ) -> None:
         rating = max(0, min(3, int(rating)))
         self.conn.execute(
             """
-            UPDATE media
-            SET caption = ?, notes = ?, category_id = ?, rating = ?
+            UPDATE media SET caption = ?, notes = ?, rating = ?
             WHERE id = ?
             """,
-            (caption, notes, category_id, rating, media_id),
+            (caption, notes, rating, media_id),
         )
-        self.conn.commit()
+        self.replace_media_tags([media_id], tag_ids)
 
     def update_media_rating(self, media_id: int, rating: int) -> None:
         rating = max(0, min(3, int(rating)))
@@ -719,14 +826,8 @@ class Database:
         self.conn.commit()
 
     def move_media(self, media_ids: list[int], category_id: int) -> None:
-        if not media_ids:
-            return
-        placeholders = ",".join("?" for _ in media_ids)
-        self.conn.execute(
-            f"UPDATE media SET category_id = ? WHERE id IN ({placeholders})",
-            [category_id, *media_ids],
-        )
-        self.conn.commit()
+        # Preserve old call sites, but add a tag instead of moving a file.
+        self.add_media_tags(media_ids, [category_id])
 
     def delete_media_ids(self, media_ids: list[int]) -> None:
         if not media_ids:
