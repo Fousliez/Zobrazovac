@@ -448,14 +448,14 @@ class Database:
         if parent_id is not None:
             parent = self.category_by_id(int(parent_id))
             if parent is None:
-                raise ValueError("Nadřazená kategorie neexistuje.")
+                raise ValueError("Nadřazená tagy neexistuje.")
             if parent["parent_id"] is not None:
                 raise ValueError(
-                    "Podkategorie může být zatím jen jednu úroveň hluboko."
+                    "Podtagy může být zatím jen jednu úroveň hluboko."
                 )
             if int(parent_id) == self.default_category_id():
                 raise ValueError(
-                    "Do kategorie „Nezařazené“ nelze přidat podkategorii."
+                    "Do tagu „Nezařazené“ nelze přidat podtag."
                 )
 
             next_order = self.conn.execute(
@@ -487,7 +487,7 @@ class Database:
 
     def rename_category(self, category_id: int, name: str) -> None:
         if category_id == self.default_category_id():
-            raise ValueError("Kategorie „Nezařazené“ má pevný název.")
+            raise ValueError("Tag „Nezařazené“ má pevný název.")
         self.conn.execute(
             "UPDATE categories SET name = ? WHERE id = ?",
             (name, category_id),
@@ -1709,7 +1709,7 @@ class MainWindow(QMainWindow):
 
         self.add_category_btn = QPushButton("＋")
         self.add_category_btn.setObjectName("miniButton")
-        self.add_category_btn.setToolTip("Nová kategorie")
+        self.add_category_btn.setToolTip("Nový tag")
         self.add_category_btn.setFixedSize(30, 30)
         sidebar_header.addWidget(self.add_category_btn)
         sidebar_layout.addLayout(sidebar_header)
@@ -1730,24 +1730,24 @@ class MainWindow(QMainWindow):
 
         self.rename_category_btn = QPushButton("Přejmenovat")
         self.rename_category_btn.setFixedHeight(30)
-        self.rename_category_btn.setToolTip("Přejmenovat vybranou kategorii")
+        self.rename_category_btn.setToolTip("Přejmenovat vybranou tag")
         category_buttons.addWidget(self.rename_category_btn)
 
         self.category_up_btn = QPushButton("↑")
         self.category_up_btn.setObjectName("miniButton")
-        self.category_up_btn.setToolTip("Posunout kategorii nahoru")
+        self.category_up_btn.setToolTip("Posunout tag nahoru")
         self.category_up_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.category_up_btn)
 
         self.category_down_btn = QPushButton("↓")
         self.category_down_btn.setObjectName("miniButton")
-        self.category_down_btn.setToolTip("Posunout kategorii dolů")
+        self.category_down_btn.setToolTip("Posunout tag dolů")
         self.category_down_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.category_down_btn)
 
         self.delete_category_btn = QPushButton("×")
         self.delete_category_btn.setObjectName("dangerMiniButton")
-        self.delete_category_btn.setToolTip("Smazat kategorii")
+        self.delete_category_btn.setToolTip("Smazat tag")
         self.delete_category_btn.setFixedSize(30, 30)
         category_buttons.addWidget(self.delete_category_btn)
 
@@ -2733,7 +2733,7 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, int(row["id"]))
             rating_text = "★" * rating if rating else "bez hodnocení"
             item.setToolTip(
-                f"Kategorie: {row['category_name']}\nHodnocení: {rating_text}"
+                f"Tagy: {row['category_name']}\nHodnocení: {rating_text}"
             )
             item.setIcon(
                 self.make_icon(
@@ -2930,8 +2930,8 @@ class MainWindow(QMainWindow):
     def add_category(self) -> None:
         name, ok = QInputDialog.getText(
             self,
-            "Nová kategorie",
-            "Název kategorie:",
+            "Nový tag",
+            "Název tagu:",
         )
         name = name.strip()
         if not ok or not name:
@@ -2943,13 +2943,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Kategorie",
-                "Kategorie s tímto názvem už existuje.",
+                "Tag s tímto názvem už existuje.",
             )
             return
 
         self.reload_categories(category_id)
         self.reload_media()
-        self.statusBar().showMessage(f"Vytvořena kategorie „{name}“.", 3500)
+        self.statusBar().showMessage(f"Vytvořen tag „{name}“.", 3500)
 
     def add_subcategory(self, parent_id: int | None = None) -> None:
         if parent_id is None:
@@ -2963,23 +2963,23 @@ class MainWindow(QMainWindow):
         if parent["parent_id"] is not None:
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Podkategorie může být zatím jen jednu úroveň hluboko.",
+                "Podtagy",
+                "Podtagy může být zatím jen jednu úroveň hluboko.",
             )
             return
         if int(parent_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Do „Nezařazené“ podkategorie nepřidáváme.",
+                "Podtagy",
+                "Do „Nezařazené“ podtagy nepřidáváme.",
             )
             return
 
         parent_name = str(parent["name"])
         name, ok = QInputDialog.getText(
             self,
-            "Nová podkategorie",
-            f"Podkategorie v „{parent_name}“:",
+            "Nový podtag",
+            f"Podtagy v „{parent_name}“:",
         )
         name = name.strip()
         if not ok or not name:
@@ -2990,19 +2990,19 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Podkategorie",
-                "Kategorie nebo podkategorie s tímto názvem už existuje.",
+                "Podtagy",
+                "Tag nebo podtag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
-            QMessageBox.information(self, "Podkategorie", str(exc))
+            QMessageBox.information(self, "Podtagy", str(exc))
             return
 
         self.expanded_category_ids.add(int(parent_id))
         self.reload_categories(category_id)
         self.reload_media()
         self.statusBar().showMessage(
-            f"Vytvořena podkategorie „{parent_name} › {name}“.",
+            f"Vytvořena podtagy „{parent_name} › {name}“.",
             3500,
         )
 
@@ -3020,13 +3020,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Kategorie",
-                "Kategorie „Nezařazené“ má pevný název.",
+                "Tag „Nezařazené“ má pevný název.",
             )
             return
 
         name, ok = QInputDialog.getText(
             self,
-            "Přejmenovat kategorii",
+            "Přejmenovat tag",
             "Nový název:",
             text=current_name,
         )
@@ -3040,7 +3040,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Kategorie",
-                "Kategorie s tímto názvem už existuje.",
+                "Tag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
@@ -3050,7 +3050,7 @@ class MainWindow(QMainWindow):
         self.reload_categories(int(category_id))
         self.reload_media()
         self.statusBar().showMessage(
-            f"Kategorie přejmenována na „{name}“.",
+            f"Tag přejmenován na „{name}“.",
             3500,
         )
 
@@ -3072,20 +3072,20 @@ class MainWindow(QMainWindow):
         if category_id is None:
             return
 
-        name = str(item.data(Qt.UserRole + 1) or "kategorii")
+        name = str(item.data(Qt.UserRole + 1) or "tag")
 
         if int(category_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
                 "Kategorie",
-                "Výchozí kategorii „Nezařazené“ nelze smazat.",
+                "Výchozí tag „Nezařazené“ nelze smazat.",
             )
             return
 
         answer = QMessageBox.question(
             self,
-            "Smazat kategorii",
-            f"Smazat kategorii „{name}“?\n\n"
+            "Smazat tag",
+            f"Smazat tag „{name}“?\n\n"
             "Média z ní se přesunou do „Nezařazené“. "
             "Původní soubory v počítači zůstanou beze změny.",
         )
@@ -3102,19 +3102,19 @@ class MainWindow(QMainWindow):
         default_id = self.db.default_category_id()
         self.reload_categories(default_id)
         self.reload_media()
-        self.statusBar().showMessage(f"Kategorie „{name}“ smazána.", 3500)
+        self.statusBar().showMessage(f"Tag „{name}“ smazána.", 3500)
 
     def show_category_context_menu(self, pos) -> None:
         menu = QMenu(self)
 
-        new_action = menu.addAction("Nová kategorie")
-        new_subcategory_action = menu.addAction("Nová podkategorie")
+        new_action = menu.addAction("Nový tag")
+        new_subcategory_action = menu.addAction("Nový podtag")
         rename_action = menu.addAction("Přejmenovat")
         menu.addSeparator()
         up_action = menu.addAction("Posunout nahoru")
         down_action = menu.addAction("Posunout dolů")
         menu.addSeparator()
-        delete_action = menu.addAction("Smazat kategorii")
+        delete_action = menu.addAction("Smazat tag")
 
         category_id = self.selected_category_id()
         is_real = category_id is not None
@@ -3350,7 +3350,7 @@ class MainWindow(QMainWindow):
                     else "bez hodnocení"
                 )
                 item.setToolTip(
-                    f"Kategorie: {row['category_name']}\n"
+                    f"Tagy: {row['category_name']}\n"
                     f"Hodnocení: {rating_text}"
                 )
 
@@ -3636,20 +3636,29 @@ class MainWindow(QMainWindow):
         self.rate_media_ids(media_ids, rating)
 
     def move_media_ids_to(
-        self,
-        media_ids: list[int],
-        category_id: int,
+        self, media_ids: list[int], category_id: int
+    ) -> None:
+        if not media_ids or category_id == self.db.default_category_id():
+            return
+        current = self.current_media_id
+        self.db.add_media_tags(media_ids, [category_id])
+        self.reload_categories(self.selected_category_id())
+        self.reload_media(select_media_id=current)
+        self.statusBar().showMessage(
+            f"Tag přidán k {len(media_ids)} položkám.", 3500
+        )
+
+    def remove_tag_from_media_ids(
+        self, media_ids: list[int], category_id: int
     ) -> None:
         if not media_ids:
             return
-
-        source_category_id = self.selected_category_id()
-        self.db.move_media(media_ids, category_id)
-        self.reload_categories(source_category_id)
-        self.reload_media(select_media_id=None)
+        current = self.current_media_id
+        self.db.remove_media_tags(media_ids, [category_id])
+        self.reload_categories(self.selected_category_id())
+        self.reload_media(select_media_id=current)
         self.statusBar().showMessage(
-            f"Přesunuto {len(media_ids)} položek.",
-            3500,
+            f"Tag odebrán u {len(media_ids)} položek.", 3500
         )
 
     def move_selected_media_to(self, category_id: int) -> None:
@@ -3708,6 +3717,7 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         open_action = menu.addAction("Otevřít původní soubor")
+        reveal_action = menu.addAction("Zobrazit umístění souboru")
 
         rating_title = (
             f"Hodnocení ({len(selected_ids)} položek)"
@@ -3728,17 +3738,23 @@ class MainWindow(QMainWindow):
                     self.rate_media_ids(list(ids), rating)
             )
 
-        move_menu = menu.addMenu("Přesunout do kategorie")
+        add_tag_menu = menu.addMenu("Přidat tag")
+        remove_tag_menu = menu.addMenu("Odebrat tag")
         frozen_move_ids = tuple(selected_ids)
-
         for row in self.db.categories():
             category_id = int(row["id"])
-            action = move_menu.addAction(
-                self.db.category_path_name(category_id)
-            )
-            action.triggered.connect(
+            if category_id == self.db.default_category_id():
+                continue
+            tag_name = self.db.category_path_name(category_id)
+            add_action = add_tag_menu.addAction(tag_name)
+            add_action.triggered.connect(
                 lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
                     self.move_media_ids_to(list(ids), target_id)
+            )
+            remove_action = remove_tag_menu.addAction(tag_name)
+            remove_action.triggered.connect(
+                lambda _checked=False, target_id=category_id, ids=frozen_move_ids:
+                    self.remove_tag_from_media_ids(list(ids), target_id)
             )
 
         menu.addSeparator()
@@ -3747,6 +3763,8 @@ class MainWindow(QMainWindow):
         chosen = menu.exec(self.media_list.mapToGlobal(pos))
         if chosen == open_action:
             self.open_current()
+        elif chosen == reveal_action:
+            self.open_current_path()
         elif chosen == delete_action:
             self.delete_selected_media()
 
