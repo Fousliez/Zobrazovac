@@ -448,14 +448,14 @@ class Database:
         if parent_id is not None:
             parent = self.category_by_id(int(parent_id))
             if parent is None:
-                raise ValueError("Nadřazená tagy neexistuje.")
+                raise ValueError("Nadřazený tag neexistuje.")
             if parent["parent_id"] is not None:
                 raise ValueError(
-                    "Podtagy může být zatím jen jednu úroveň hluboko."
+                    "Podtag může být zatím jen jednu úroveň hluboko."
                 )
             if int(parent_id) == self.default_category_id():
                 raise ValueError(
-                    "Do tagu „Nezařazené“ nelze přidat podtag."
+                    "Do „Nezařazené“ nelze přidat podtag."
                 )
 
             next_order = self.conn.execute(
@@ -487,7 +487,7 @@ class Database:
 
     def rename_category(self, category_id: int, name: str) -> None:
         if category_id == self.default_category_id():
-            raise ValueError("Tag „Nezařazené“ má pevný název.")
+            raise ValueError("Položka „Nezařazené“ má pevný název.")
         self.conn.execute(
             "UPDATE categories SET name = ? WHERE id = ?",
             (name, category_id),
@@ -2942,7 +2942,7 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Kategorie",
+                "Tagy",
                 "Tag s tímto názvem už existuje.",
             )
             return
@@ -2963,15 +2963,15 @@ class MainWindow(QMainWindow):
         if parent["parent_id"] is not None:
             QMessageBox.information(
                 self,
-                "Podtagy",
-                "Podtagy může být zatím jen jednu úroveň hluboko.",
+                "Podtag",
+                "Podtag může být zatím jen jednu úroveň hluboko.",
             )
             return
         if int(parent_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Podtagy",
-                "Do „Nezařazené“ podtagy nepřidáváme.",
+                "Podtag",
+                "Do „Nezařazené“ nelze přidat podtag.",
             )
             return
 
@@ -2979,7 +2979,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(
             self,
             "Nový podtag",
-            f"Podtagy v „{parent_name}“:",
+            f"Název podtagu v „{parent_name}“:",
         )
         name = name.strip()
         if not ok or not name:
@@ -2990,19 +2990,19 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Podtagy",
+                "Podtag",
                 "Tag nebo podtag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
-            QMessageBox.information(self, "Podtagy", str(exc))
+            QMessageBox.information(self, "Podtag", str(exc))
             return
 
         self.expanded_category_ids.add(int(parent_id))
         self.reload_categories(category_id)
         self.reload_media()
         self.statusBar().showMessage(
-            f"Vytvořena podtagy „{parent_name} › {name}“.",
+            f"Vytvořen podtag „{parent_name} › {name}“.",
             3500,
         )
 
@@ -3019,7 +3019,7 @@ class MainWindow(QMainWindow):
         if int(category_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Kategorie",
+                "Tagy",
                 "Tag „Nezařazené“ má pevný název.",
             )
             return
@@ -3039,12 +3039,12 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.information(
                 self,
-                "Kategorie",
+                "Tagy",
                 "Tag s tímto názvem už existuje.",
             )
             return
         except ValueError as exc:
-            QMessageBox.information(self, "Kategorie", str(exc))
+            QMessageBox.information(self, "Tagy", str(exc))
             return
 
         self.reload_categories(int(category_id))
@@ -3077,7 +3077,7 @@ class MainWindow(QMainWindow):
         if int(category_id) == self.db.default_category_id():
             QMessageBox.information(
                 self,
-                "Kategorie",
+                "Tagy",
                 "Výchozí tag „Nezařazené“ nelze smazat.",
             )
             return
@@ -3086,7 +3086,7 @@ class MainWindow(QMainWindow):
             self,
             "Smazat tag",
             f"Smazat tag „{name}“?\n\n"
-            "Média z ní se přesunou do „Nezařazené“. "
+            "Tag se odebere ze všech médií. Ostatní tagy zůstanou zachované. "
             "Původní soubory v počítači zůstanou beze změny.",
         )
         if answer != QMessageBox.Yes:
@@ -3096,13 +3096,13 @@ class MainWindow(QMainWindow):
             self.db.delete_category(int(category_id))
             self.expanded_category_ids.discard(int(category_id))
         except ValueError as exc:
-            QMessageBox.information(self, "Kategorie", str(exc))
+            QMessageBox.information(self, "Tagy", str(exc))
             return
 
         default_id = self.db.default_category_id()
         self.reload_categories(default_id)
         self.reload_media()
-        self.statusBar().showMessage(f"Tag „{name}“ smazána.", 3500)
+        self.statusBar().showMessage(f"Tag „{name}“ smazán.", 3500)
 
     def show_category_context_menu(self, pos) -> None:
         menu = QMenu(self)
@@ -3599,7 +3599,7 @@ class MainWindow(QMainWindow):
         self.reload_media(select_media_id=media_id)
 
         row = self.db.media_by_id(media_id)
-        if row is not None:
+        if row is not None and self.current_media_id == media_id:
             self.current_rating = max(0, min(3, int(row["rating"] or 0)))
             self._refresh_rating_buttons()
             self.notes_edit.setReadOnly(True)
