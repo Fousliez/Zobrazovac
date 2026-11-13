@@ -1475,7 +1475,8 @@ class MainWindow(QMainWindow):
         self.current_preview_path: Path | None = None
         self.current_preview_type: str | None = None
         self.current_rating = 0
-        self.loaded_detail_state: tuple[str, str, int, int] | None = None
+        self.loaded_detail_state: tuple[str, str, tuple[int, ...], int] | None = None
+        self.selected_detail_tag_ids: set[int] = set()
         self.loading_detail = False
         self.thumbnail_mode = "medium"
         self.sort_descending = True
@@ -1964,12 +1965,16 @@ class MainWindow(QMainWindow):
         )
         detail_layout.addWidget(self.caption_edit)
 
-        category_label = QLabel("Kategorie")
+        category_label = QLabel("Tagy")
         category_label.setObjectName("fieldLabel")
         detail_layout.addWidget(category_label)
 
-        self.category_combo = QComboBox()
-        detail_layout.addWidget(self.category_combo)
+        self.detail_tag_button = QPushButton("Bez tagů")
+        self.detail_tag_button.setEnabled(False)
+        self.detail_tag_button.setToolTip("Vyber tagy přiřazené tomuto médiu")
+        self.detail_tags_menu = QMenu(self.detail_tag_button)
+        self.detail_tag_button.setMenu(self.detail_tags_menu)
+        detail_layout.addWidget(self.detail_tag_button)
 
         buttons = QHBoxLayout()
         self.save_btn = QPushButton("Uložit změny")
@@ -2033,7 +2038,6 @@ class MainWindow(QMainWindow):
         self.caption_edit.textChanged.connect(self._on_detail_edited)
         self.notes_edit.textChanged.connect(self._on_detail_edited)
         self.notes_edit.editRequested.connect(self._enable_note_editing)
-        self.category_combo.currentIndexChanged.connect(self._on_detail_edited)
 
         self.save_btn.clicked.connect(self.save_current)
         self.delete_media_btn.clicked.connect(self.delete_selected_media)
@@ -3199,9 +3203,11 @@ class MainWindow(QMainWindow):
             self.notes_edit.setReadOnly(True)
             self.notes_edit.setPlainText(row["notes"])
 
-            combo_index = self.category_combo.findData(int(row["category_id"]))
-            if combo_index >= 0:
-                self.category_combo.setCurrentIndex(combo_index)
+            self.selected_detail_tag_ids = set(
+                self.db.tags_for_media(int(row["id"]))
+            )
+            self._rebuild_detail_tag_menu()
+            self.detail_tag_button.setEnabled(True)
 
             self.current_rating = max(0, min(3, int(row["rating"] or 0)))
             for button in self.rating_buttons:
@@ -3211,7 +3217,7 @@ class MainWindow(QMainWindow):
             self.loaded_detail_state = (
                 str(row["caption"]),
                 str(row["notes"]),
-                int(row["category_id"]),
+                tuple(sorted(self.selected_detail_tag_ids)),
                 self.current_rating,
             )
 
@@ -3227,18 +3233,56 @@ class MainWindow(QMainWindow):
 
         self._update_save_button_state()
 
-    def _current_detail_state(self) -> tuple[str, str, int, int] | None:
+    def _rebuild_detail_tag_menu(self) -> None:
+        self.detail_tags_menu.clear()
+        default_id = self.db.default_category_id()
+        for row in self.db.categories():
+            tag_id = int(row["id"])
+            if tag_id == default_id:
+                continue
+            action = self.detail_tags_menu.addAction(
+                self.db.category_path_name(tag_id)
+            )
+            action.setCheckable(True)
+            action.setChecked(tag_id in self.selected_detail_tag_ids)
+            action.triggered.connect(
+                lambda checked, selected_id=tag_id:
+                    self.toggle_detail_tag(selected_id, checked)
+            )
+        self._refresh_detail_tag_label()
+
+    def _refresh_detail_tag_label(self) -> None:
+        names = [
+            self.db.category_path_name(tag_id)
+            for tag_id in sorted(self.selected_detail_tag_ids)
+        ]
+        summary = ", ".join(names)
+        if len(names) > 2:
+            summary = ", ".join(names[:2]) + f" (+{len(names) - 2})"
+        self.detail_tag_button.setText(summary or "Bez tagů")
+        self.detail_tag_button.setToolTip(
+            ", ".join(names) if names else "Médium nemá žádné tagy"
+        )
+
+    def toggle_detail_tag(self, tag_id: int, checked: bool) -> None:
+        if self.current_media_id is None:
+            return
+        if checked:
+            self.selected_detail_tag_ids.add(tag_id)
+        else:
+            self.selected_detail_tag_ids.discard(tag_id)
+        self._refresh_detail_tag_label()
+        self._on_detail_edited()
+
+    def _current_detail_state(
+        self,
+    ) -> tuple[str, str, tuple[int, ...], int] | None:
         if self.current_media_id is None:
             return None
-
-        category_id = self.category_combo.currentData()
-        if category_id is None:
-            return None
-
         return (
             self.caption_edit.text(),
             self.notes_edit.toPlainText(),
-            int(category_id),
+            tuple(sorted(self.selected_detail_tag_ids)),
             int(self.current_rating),
         )
 
@@ -3539,10 +3583,6 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        category_id = self.category_combo.currentData()
-        if category_id is None:
-            return
-
         media_id = self.current_media_id
         selected_category = self.selected_category_id()
         caption = self.caption_edit.text()
@@ -3552,10 +3592,9 @@ class MainWindow(QMainWindow):
             media_id,
             caption.strip(),
             notes.strip(),
-            int(category_id),
+            sorted(self.selected_detail_tag_ids),
             int(self.current_rating),
         )
-
         self.reload_categories(selected_category)
         self.reload_media(select_media_id=media_id)
 
@@ -3568,7 +3607,7 @@ class MainWindow(QMainWindow):
             self.loaded_detail_state = (
                 str(row["caption"]),
                 str(row["notes"]),
-                int(row["category_id"]),
+                tuple(sorted(self.db.tags_for_media(media_id))),
                 self.current_rating,
             )
 
@@ -3825,6 +3864,10 @@ class MainWindow(QMainWindow):
         self.current_preview_type = None
         self.current_rating = 0
         self.loaded_detail_state = None
+        self.selected_detail_tag_ids.clear()
+        self.detail_tag_button.setEnabled(False)
+        self.detail_tags_menu.clear()
+        self._refresh_detail_tag_label()
         self.save_feedback_active = False
 
         if self.current_movie is not None:
