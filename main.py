@@ -54,7 +54,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-APP_VERSION = "0.9.16"
+APP_VERSION = "0.9.17"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -486,6 +486,70 @@ class Database:
         )
         self.conn.commit()
         return int(cursor.lastrowid)
+
+    def add_categories_batch(
+        self,
+        names: list[str],
+        parent_id: int | None = None,
+    ) -> tuple[list[int], list[str]]:
+        """Create tags in input order; skip names that already exist."""
+        if parent_id is not None:
+            parent = self.category_by_id(int(parent_id))
+            if parent is None:
+                raise ValueError("Nadřazený tag neexistuje.")
+            if parent["parent_id"] is not None:
+                raise ValueError("Podtag může být zatím jen jednu úroveň hluboko.")
+            if int(parent_id) == self.default_category_id():
+                raise ValueError("Do „Nezařazené“ nelze přidat podtag.")
+
+        existing = {
+            str(row["name"]).casefold()
+            for row in self.conn.execute("SELECT name FROM categories")
+        }
+        new_names = []
+        duplicates = []
+        for name in names:
+            name = name.strip()
+            if not name:
+                continue
+            key = name.casefold()
+            if key in existing:
+                duplicates.append(name)
+            else:
+                existing.add(key)
+                new_names.append(name)
+
+        if not new_names:
+            return [], duplicates
+
+        if parent_id is None:
+            next_order = int(self.conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order) + 1, 0)
+                FROM categories WHERE parent_id IS NULL
+                """
+            ).fetchone()[0])
+        else:
+            next_order = int(self.conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order) + 1, 0)
+                FROM categories WHERE parent_id = ?
+                """,
+                (int(parent_id),),
+            ).fetchone()[0])
+
+        created = []
+        with self.conn:
+            for index, name in enumerate(new_names):
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO categories(name, sort_order, parent_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (name, next_order + index, parent_id),
+                )
+                created.append(int(cursor.lastrowid))
+        return created, duplicates
 
     def rename_category(self, category_id: int, name: str) -> None:
         if category_id == self.default_category_id():
@@ -2930,28 +2994,37 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 5000)
 
     def add_category(self) -> None:
-        name, ok = QInputDialog.getText(
+        names_text, ok = QInputDialog.getMultiLineText(
             self,
-            "Nový tag",
-            "Název tagu:",
+            "Nové tagy",
+            "Zadej názvy tagů (každý na samostatný řádek):",
         )
-        name = name.strip()
-        if not ok or not name:
+        if not ok or not names_text.strip():
             return
 
         try:
-            category_id = self.db.add_category(name)
-        except sqlite3.IntegrityError:
-            QMessageBox.information(
-                self,
-                "Tagy",
-                "Tag s tímto názvem už existuje.",
+            created, duplicates = self.db.add_categories_batch(
+                names_text.splitlines()
             )
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            QMessageBox.information(self, "Tagy", str(exc))
             return
 
-        self.reload_categories(category_id)
-        self.reload_media()
-        self.statusBar().showMessage(f"Vytvořen tag „{name}“.", 3500)
+        if created:
+            self.reload_categories(created[0])
+            self.reload_media()
+        if duplicates:
+            QMessageBox.information(
+                self,
+                "Již existující tagy",
+                "Tyto tagy už existují, proto nebyly vytvořeny znovu:\n"
+                + ", ".join(duplicates),
+            )
+        self.statusBar().showMessage(
+            f"Vytvořeno {len(created)} tagů."
+            if created else "Žádný nový tag nebyl vytvořen.",
+            3500,
+        )
 
     def add_subcategory(self, parent_id: int | None = None) -> None:
         if parent_id is None:
@@ -2964,47 +3037,46 @@ class MainWindow(QMainWindow):
             return
         if parent["parent_id"] is not None:
             QMessageBox.information(
-                self,
-                "Podtag",
-                "Podtag může být zatím jen jednu úroveň hluboko.",
+                self, "Podtag", "Podtag může být zatím jen jednu úroveň hluboko."
             )
             return
         if int(parent_id) == self.db.default_category_id():
             QMessageBox.information(
-                self,
-                "Podtag",
-                "Do „Nezařazené“ nelze přidat podtag.",
+                self, "Podtag", "Do „Nezařazené“ nelze přidat podtag."
             )
             return
 
         parent_name = str(parent["name"])
-        name, ok = QInputDialog.getText(
+        names_text, ok = QInputDialog.getMultiLineText(
             self,
-            "Nový podtag",
-            f"Název podtagu v „{parent_name}“:",
+            "Nové podtagy",
+            f"Podtagy v „{parent_name}“ (každý na samostatný řádek):",
         )
-        name = name.strip()
-        if not ok or not name:
+        if not ok or not names_text.strip():
             return
 
         try:
-            category_id = self.db.add_category(name, int(parent_id))
-        except sqlite3.IntegrityError:
-            QMessageBox.information(
-                self,
-                "Podtag",
-                "Tag nebo podtag s tímto názvem už existuje.",
+            created, duplicates = self.db.add_categories_batch(
+                names_text.splitlines(), int(parent_id)
             )
-            return
-        except ValueError as exc:
-            QMessageBox.information(self, "Podtag", str(exc))
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            QMessageBox.information(self, "Podtagy", str(exc))
             return
 
-        self.expanded_category_ids.add(int(parent_id))
-        self.reload_categories(category_id)
-        self.reload_media()
+        if created:
+            self.expanded_category_ids.add(int(parent_id))
+            self.reload_categories(created[0])
+            self.reload_media()
+        if duplicates:
+            QMessageBox.information(
+                self,
+                "Již existující tagy",
+                "Tyto názvy už jsou použité, proto nebyly vytvořeny znovu:\n"
+                + ", ".join(duplicates),
+            )
         self.statusBar().showMessage(
-            f"Vytvořen podtag „{parent_name} › {name}“.",
+            f"Vytvořeno {len(created)} podtagů."
+            if created else "Žádný nový podtag nebyl vytvořen.",
             3500,
         )
 
